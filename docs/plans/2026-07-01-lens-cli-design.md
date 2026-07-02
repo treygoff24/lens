@@ -1,6 +1,6 @@
 # lens — agent-first image library CLI
 
-**Status:** design, pre-review. **Provenance:** graduation of `volley/librarian.py` (validated 2026-07-01: 1,128 images indexed in ~45s for $1.87; search 8/8 relevant in ~1s via whole-index prompt with cached prefix). Sibling of `recon` — same envelope contract, same exit-code dictionary, same foundation code, same consumer: coding agents.
+**Status:** design, reviewed (Codex adversarial review 2026-07-01, 13 findings; amendments in the final section). **Provenance:** graduation of `volley/librarian.py` (validated 2026-07-01: 1,128 images indexed in ~45s for $1.87; search 8/8 relevant in ~1s via whole-index prompt with cached prefix). Sibling of `recon` — same envelope contract, same exit-code dictionary, same foundation code, same consumer: coding agents.
 
 ## Thesis
 
@@ -75,6 +75,24 @@ clap, serde/serde_json, thiserror, ureq (rustls), toml, base64, sha2, **image** 
 ## Non-goals (v1)
 
 Video files, PDF pages, RAW formats; watch/daemon mode; near-duplicate detection; `rename` command (the `filename` field already in the index is the v2 seam); non-Cerebras providers; Windows sips-equivalent.
+
+## Design-review amendments (Codex, 2026-07-01 — accepted findings)
+
+1. **Single-writer index (was the blocker).** `lens index` takes a per-library advisory lock: `index.lock` created with `create_new`, containing PID + timestamp; a lock older than 30 minutes is stale and stolen with a warning. Second concurrent writer → exit 3 with suggestedFix naming the lock path. Appends are one complete line per write syscall; prune rewrites via temp file + atomic rename; index load tolerates (and truncates) one torn trailing line.
+2. **Deterministic search snapshot.** `find` never trusts file order: it loads records, dedupes by relPath (last wins), sorts by NFC-normalized relPath, and assigns line IDs at query time. The serialized prefix is therefore byte-identical for an unchanged index regardless of append/resume/prune history. Any index mutation makes the next search cold — documented, accepted.
+3. **Budget reservation ledger.** `may_launch` alone allows N-workers × unit overshoot. Budget gains reserve/settle: inside the gate mutex, `reserve(projected)` counts toward the cap; on completion the reservation converts to actual spend (or releases on failure). Overshoot bound drops to actual-vs-projected error only. `CAPTION_WORST_CASE_COST = $0.008` (1,200 completion tokens ≈ $0.0032 + image + prompt tokens + one re-roll headroom; measured avg $0.00166).
+4. **Freshness key**: `(relPath NFC-normalized, size, mtime_ns)` — nanoseconds, not ms. Content hashing rejected: reads the whole library per status check. Case-only renames fall out naturally as new+vanished.
+5. **Moved libraries**: meta.json stores the display path; if it no longer resolves to the same canonical path, exit 3 with suggestedFix (`--index-path` or reindex). Volume IDs rejected as overkill.
+6. **Chunked recall**: per-chunk take = `max(top × 3, 20)`, dedupe by relPath before rerank. Adaptive second pass rejected (v2).
+7. **Token estimate**: from exact serialized prompt bytes at a conservative 3 bytes/token, chunk cap 70K tokens including query + schema overhead; `find --dry-run` reports the chosen path and chunk count.
+8. **EXIF orientation**: read and `apply_orientation()` before resize for JPEG/WebP/TIFF; EXIF-rotated fixture in tests.
+9. **Normalization matrix pinned**: animated GIF/WebP → first frame; decode failure on a supported extension → sips fallback → `corrupt_image` skip reason (distinct from `unsupported_format`); decode pixel limits enforced.
+10. **Version-aware staleness**: meta.json carries `model`, `promptVersion`, `normalizerVersion`; mismatch marks the whole index stale (status reports it; index recaptions with a warning). Per-row versions rejected.
+11. **suggestedFix in human mode**: the ported human-mode error renderer must print suggestedFix (recon's doesn't) — golden test required.
+12. **Invalid find IDs**: dropped IDs surface in `warnings.invalidIdsDropped`; if ALL returned IDs are invalid → one re-roll, then upstream error.
+13. **Gallery kept** (explicit `--gallery PATH` only, never default, all model-derived text HTML-escaped). Cutting it rejected — it's the human-verification affordance.
+
+Rejected: content-hash freshness (F4-part), volume/file IDs (F5-part), adaptive second search pass (F6-part), gallery removal (F13-part).
 
 ## Waves
 
