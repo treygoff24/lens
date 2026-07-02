@@ -2,4 +2,8 @@ pub mod budget;
 pub mod config;
 pub mod envelope;
 pub mod error;
+pub mod indexer;
+pub mod normalize;
 pub mod providers;
+pub mod store;
+pub mod walk;

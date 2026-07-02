@@ -94,6 +94,8 @@ Video files, PDF pages, RAW formats; watch/daemon mode; near-duplicate detection
 
 Rejected: content-hash freshness (F4-part), volume/file IDs (F5-part), adaptive second search pass (F6-part), gallery removal (F13-part).
 
+**Wave-2 review waivers (Cursor round, 2026-07-01):** NFC normalization of relPaths waived — indexes are XDG-keyed by canonical library path and never travel between machines, so walk/store self-consistency is sufficient; revisit if `--index-path` portability becomes a real workflow. Normalize ceiling clarified: re-encode path allows raw JPEG ≤6.5MB (×1.33 base64 = 8.6MB, inside Cerebras's 10MB payload cap); the 3MB figure applies to the pass-through gate only. Lock staleness is mtime-based (30min) without PID liveness — a >30min hung indexer can be stolen from; documented limit, not defended (PID probes need libc).
+
 ## Waves
 
 1. **Foundation port** — scaffold + error/envelope/config/budget/providers(cerebras + image content part, no exa) adapted from recon; golden envelope tests. (Codex)

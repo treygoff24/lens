@@ -50,10 +50,9 @@ impl Budget {
         }
 
         let mut outstanding = self.outstanding();
-        if self
-            .max_dollars
-            .is_some_and(|cap| spend.total_dollars() + *outstanding + projected_unit_cost > cap)
-        {
+        if self.max_dollars.is_some_and(|cap| {
+            spend.total_dollars() + *outstanding + projected_unit_cost > cap + 1e-9
+        }) {
             let _ = self.hit.set("dollars");
             return None;
         }
@@ -84,7 +83,7 @@ impl Budget {
         }
 
         if self.max_dollars.is_some_and(|cap| {
-            spend.total_dollars() + *self.outstanding() + projected_unit_cost > cap
+            spend.total_dollars() + *self.outstanding() + projected_unit_cost > cap + 1e-9
         }) {
             let _ = self.hit.set("dollars");
             return false;
@@ -223,5 +222,20 @@ mod tests {
 
         assert!(!budget.may_launch(&Spend::default(), 0.0));
         assert_eq!(budget.hit(), Some("seconds"));
+    }
+
+    #[test]
+    fn f4_epsilon_boundary_allows_exact_fit() {
+        // Pins the f64 epsilon fix: 0.001 + 0 + 0.008 == 0.009 in exact math,
+        // but f64 representation makes 0.001 + 0.008 > 0.009 true without the
+        // epsilon. With the 1e-9 tolerance, this must be allowed.
+        let budget = Budget::new(Some(0.009), None);
+        let spend = Spend {
+            dollars: 0.001,
+            ..Spend::default()
+        };
+
+        assert!(budget.reserve(&spend, 0.008).is_some());
+        assert_eq!(budget.hit(), None);
     }
 }
