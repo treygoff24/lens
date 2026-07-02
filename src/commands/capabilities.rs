@@ -13,7 +13,7 @@ pub fn run(_global: &GlobalArgs) -> Result<CommandSuccess, LensError> {
         "schema": "lens.cli.capabilities.v1",
         "commands": [
             {"name": "index", "usage": "lens index [DIR]", "readOnly": false, "destructive": false, "spendsMoney": true, "writesIndex": true, "stdout": "lens.cli.response.v1", "stderrOnError": "lens.cli.error.v1"},
-            {"name": "find", "usage": "lens find <QUERY> [--dir DIR] [--top N] [--gallery PATH]", "readOnly": true, "readOnlyNote": "read-only on the library; --gallery writes the requested HTML file", "destructive": false, "spendsMoney": true},
+            {"name": "find", "usage": "lens find <QUERY> [--dir DIR] [--top N] [--kind KIND] [--gallery PATH]", "readOnly": true, "readOnlyNote": "read-only on the library; --gallery writes the requested HTML file", "destructive": false, "spendsMoney": true},
             {"name": "status", "usage": "lens status [--dir DIR]", "readOnly": true, "destructive": false, "spendsMoney": false},
             {"name": "doctor", "usage": "lens doctor [--online]", "readOnly": true, "destructive": false, "spendsMoney": true, "spendsMoneyNote": "only with --online"},
             {"name": "capabilities", "usage": "lens capabilities", "readOnly": true, "destructive": false, "spendsMoney": false},
@@ -48,9 +48,9 @@ pub fn run(_global: &GlobalArgs) -> Result<CommandSuccess, LensError> {
         ],
         "skipReasons": ["unsupported_format", "corrupt_image", "too_large", "budget_refused"],
         "costExpectations": {
-            "captionMeasuredAverageDollars": 0.0017,
+            "captionMeasuredAverageDollars": 0.00166,
             "captionWorstCaseDollars": CAPTION_WORST_CASE_COST,
-            "prototypeRun": "1128 images ≈ 45s ≈ $1.87",
+            "prototypeRun": "1100 images ≈ 93s ≈ $2.29 (measured 2026-07-02)",
             "find": "pennies; projected from serialized index tokens"
         },
         "indexStorage": "${XDG_DATA_HOME:-~/.local/share}/lens/libraries/<sha256(canonical_path)[..16]>/",

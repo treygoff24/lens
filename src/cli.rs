@@ -87,6 +87,10 @@ pub struct FindArgs {
     #[arg(long, value_name = "N", default_value_t = 8, value_parser = parse_top)]
     pub top: usize,
 
+    /// Filter to records of these kinds before searching (repeatable, comma-separable; e.g. photo, graphic).
+    #[arg(long = "kind", value_name = "KIND", value_delimiter = ',', value_parser = parse_kind)]
+    pub kind: Vec<String>,
+
     /// Write a dark contact-sheet HTML file for the hits.
     #[arg(long, value_name = "PATH", value_hint = clap::ValueHint::FilePath)]
     pub gallery: Option<PathBuf>,
@@ -142,6 +146,15 @@ fn parse_positive_f64(value: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_kind(value: &str) -> Result<String, String> {
+    let kind = value.trim().to_lowercase();
+    if kind.is_empty() {
+        Err("--kind value must not be empty".to_string())
+    } else {
+        Ok(kind)
+    }
+}
+
 pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
     let mut costs: Vec<usize> = (0..=b.len()).collect();
     for (i, ca) in a.chars().enumerate() {
@@ -164,6 +177,7 @@ pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
     use clap::Parser;
+    use clap::error::ErrorKind;
 
     #[test]
     fn no_default_query_subcommand() {
@@ -182,5 +196,70 @@ mod tests {
             }
             _ => panic!("wrong command"),
         }
+    }
+
+    #[test]
+    fn parses_repeatable_and_comma_separated_kind_filters() {
+        let cli =
+            Cli::try_parse_from(["lens", "find", "q", "--kind", "photo", "--kind", "graphic"])
+                .unwrap();
+        match cli.command {
+            Commands::Find(args) => assert_eq!(args.kind, ["photo", "graphic"]),
+            _ => panic!("wrong command"),
+        }
+
+        let cli = Cli::try_parse_from(["lens", "find", "q", "--kind", "photo,graphic"]).unwrap();
+        match cli.command {
+            Commands::Find(args) => assert_eq!(args.kind, ["photo", "graphic"]),
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn empty_kind_filter_is_parse_error() {
+        let err = Cli::try_parse_from(["lens", "find", "q", "--kind", ""]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        assert!(err.to_string().contains("--kind"));
+    }
+
+    #[test]
+    fn top_range_is_validated_at_parse_boundary() {
+        assert!(Cli::try_parse_from(["lens", "find", "q", "--top", "0"]).is_err());
+        assert!(Cli::try_parse_from(["lens", "find", "q", "--top", "101"]).is_err());
+        let cli = Cli::try_parse_from(["lens", "find", "q", "--top", "100"]).unwrap();
+        match cli.command {
+            Commands::Find(args) => assert_eq!(args.top, 100),
+            _ => panic!("wrong command"),
+        }
+    }
+
+    #[test]
+    fn concurrency_range_and_default_are_validated_at_parse_boundary() {
+        assert!(Cli::try_parse_from(["lens", "--concurrency", "0", "find", "q"]).is_err());
+        assert!(Cli::try_parse_from(["lens", "--concurrency", "51", "find", "q"]).is_err());
+        let cli = Cli::try_parse_from(["lens", "find", "q"]).unwrap();
+        assert_eq!(cli.global.concurrency, 25);
+    }
+
+    #[test]
+    fn budget_flags_are_validated_at_parse_boundary() {
+        assert!(Cli::try_parse_from(["lens", "--max-dollars", "-1", "find", "q"]).is_err());
+        assert!(Cli::try_parse_from(["lens", "--max-dollars", "0", "find", "q"]).is_ok());
+        assert!(Cli::try_parse_from(["lens", "--max-seconds", "0", "find", "q"]).is_err());
+    }
+
+    #[test]
+    fn global_json_flag_parses_after_find_subcommand() {
+        let cli = Cli::try_parse_from(["lens", "find", "q", "--json"]).unwrap();
+        assert!(cli.global.json);
+    }
+
+    #[test]
+    fn find_query_is_required_and_non_empty() {
+        let err = Cli::try_parse_from(["lens", "find"]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+
+        let err = Cli::try_parse_from(["lens", "find", ""]).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidValue);
     }
 }

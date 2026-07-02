@@ -58,6 +58,29 @@ fn json_stderr(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stderr).unwrap()
 }
 
+fn write_index_records(index_dir: &Path, records: &[Value]) {
+    std::fs::create_dir_all(index_dir).unwrap();
+    let mut jsonl = String::new();
+    for record in records {
+        jsonl.push_str(&record.to_string());
+        jsonl.push('\n');
+    }
+    std::fs::write(index_dir.join("index.jsonl"), jsonl).unwrap();
+}
+
+fn index_record(rel_path: &str, kind: &str, description: &str) -> Value {
+    serde_json::json!({
+        "relPath": rel_path,
+        "size": 1u64,
+        "mtimeNs": 1i128,
+        "description": description,
+        "filename": rel_path,
+        "tags": [kind],
+        "textContent": "",
+        "kind": kind,
+    })
+}
+
 fn run_index(server: &MockServer, home: &Path, xdg: &Path, dir: &Path) -> std::process::Output {
     lens_cmd(home, xdg)
         .env("CEREBRAS_API_KEY", "fake-cerebras")
@@ -397,6 +420,15 @@ fn capabilities_and_schema_emit_contract_envelopes() {
     assert_eq!(
         stdout["data"]["exitCodes"]["10"],
         "partial/refused; stdout carries ok:true success envelope with budget.hit set"
+    );
+    // F2: capabilities cost expectations reflect live-acceptance measurements.
+    assert!(
+        stdout["data"]["costExpectations"]["prototypeRun"]
+            .as_str()
+            .unwrap()
+            .contains("93s"),
+        "prototypeRun should contain '93s', got: {}",
+        stdout["data"]["costExpectations"]["prototypeRun"]
     );
 
     let response_schema = lens_cmd(&home, &xdg)
@@ -774,10 +806,371 @@ fn schema_response_find_data_has_required_fields() {
     assert!(props.contains_key("estimatedTokens"));
     assert!(props.contains_key("projectedCostDollars"));
     assert!(props.contains_key("invalidIdsDropped"));
+    // F1: kindFilter (array of strings, omitted when empty) must be declared.
+    assert!(props.contains_key("kindFilter"));
     // Core fields still present.
     assert!(props.contains_key("query"));
     assert!(props.contains_key("hits"));
     assert!(props.contains_key("mode"));
     assert!(props.contains_key("chunks"));
     assert!(props.contains_key("warnings"));
+}
+
+#[test]
+fn find_kind_filters_records_before_model_call() {
+    let server = MockServer::with(vec![], vec![vec![0]]);
+    let home = temp_root("home-find-kind");
+    let xdg = temp_root("xdg-find-kind");
+    let dir = temp_root("library-find-kind");
+    let index_dir = temp_root("index-find-kind");
+    // F3: use distinct, greppable description markers so the request body can
+    // be inspected to prove the kind filter excluded the graphic record.
+    write_index_records(
+        &index_dir,
+        &[
+            index_record("a-graphic.png", "graphic", "GRAPHIC_MARKER_BETA"),
+            index_record("z-photo.png", "photo", "PHOTO_MARKER_ALPHA"),
+        ],
+    );
+
+    let output = lens_cmd(&home, &xdg)
+        .env("CEREBRAS_API_KEY", "fake-cerebras")
+        .env("LENS_API_BASE", server.base_url())
+        .arg("--json")
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg("find")
+        .arg("photo")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--kind")
+        .arg("photo")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = json_stdout(&output);
+    assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
+    assert_eq!(stdout["data"]["searched"], 1);
+    assert_eq!(stdout["data"]["hits"][0]["relPath"], "z-photo.png");
+    assert_eq!(stdout["data"]["hits"][0]["kind"], "photo");
+    assert!(server.request_count() >= 1);
+
+    // F3: inspect the actual request body the mock received — the serialized
+    // prompt must contain the photo record's description marker and must NOT
+    // contain the graphic record's description marker.
+    let body = server
+        .last_request_body()
+        .expect("at least one request must have reached the mock");
+    assert!(
+        body.contains("PHOTO_MARKER_ALPHA"),
+        "request body must contain the photo record's description marker"
+    );
+    assert!(
+        !body.contains("GRAPHIC_MARKER_BETA"),
+        "request body must NOT contain the graphic record's description marker"
+    );
+}
+
+#[test]
+fn find_kind_zero_match_returns_empty_success_without_model_call() {
+    let server = MockServer::start();
+    let home = temp_root("home-find-kind-zero");
+    let xdg = temp_root("xdg-find-kind-zero");
+    let dir = temp_root("library-find-kind-zero");
+    let index_dir = temp_root("index-find-kind-zero");
+    write_index_records(
+        &index_dir,
+        &[
+            index_record("photo.png", "photo", "photo line"),
+            index_record("graphic.png", "graphic", "graphic line"),
+        ],
+    );
+
+    let output = lens_cmd(&home, &xdg)
+        .arg("--json")
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg("find")
+        .arg("anything")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--kind")
+        .arg("nosuchkind")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = json_stdout(&output);
+    assert_eq!(stdout["data"]["outcome"], "answered");
+    assert_eq!(stdout["data"]["hits"].as_array().unwrap().len(), 0);
+    assert_eq!(stdout["data"]["searched"], 0);
+    assert_eq!(
+        stdout["data"]["warnings"],
+        serde_json::json!(["kind filter matched 0 of 2 records; kinds present: graphic,photo"])
+    );
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn find_dry_run_kind_filter_reduces_token_estimate_without_network() {
+    let server = MockServer::start();
+    let home = temp_root("home-find-kind-dry");
+    let xdg = temp_root("xdg-find-kind-dry");
+    let dir = temp_root("library-find-kind-dry");
+    let index_dir = temp_root("index-find-kind-dry");
+    let long_photo = "photo description ".repeat(80);
+    let long_graphic = "graphic description ".repeat(80);
+    write_index_records(
+        &index_dir,
+        &[
+            index_record("photo.png", "photo", &long_photo),
+            index_record("graphic.png", "graphic", &long_graphic),
+        ],
+    );
+
+    let all = lens_cmd(&home, &xdg)
+        .arg("--json")
+        .arg("--dry-run")
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg("find")
+        .arg("anything")
+        .arg("--dir")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    let filtered = lens_cmd(&home, &xdg)
+        .arg("--json")
+        .arg("--dry-run")
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg("find")
+        .arg("anything")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--kind")
+        .arg("photo")
+        .output()
+        .unwrap();
+
+    assert_eq!(all.status.code(), Some(0));
+    assert_eq!(filtered.status.code(), Some(0));
+    let all = json_stdout(&all);
+    let filtered = json_stdout(&filtered);
+    assert_eq!(filtered["data"]["kindFilter"], serde_json::json!(["photo"]));
+    assert_eq!(filtered["data"]["searched"], 1);
+    assert!(
+        filtered["data"]["estimatedTokens"].as_u64().unwrap()
+            < all["data"]["estimatedTokens"].as_u64().unwrap()
+    );
+    assert_eq!(server.request_count(), 0);
+}
+
+#[test]
+fn find_kind_filter_is_case_insensitive() {
+    let server = MockServer::with(vec![], vec![vec![0]]);
+    let home = temp_root("home-find-kind-case");
+    let xdg = temp_root("xdg-find-kind-case");
+    let dir = temp_root("library-find-kind-case");
+    let index_dir = temp_root("index-find-kind-case");
+    write_index_records(
+        &index_dir,
+        &[index_record("photo.png", "photo", "photo line")],
+    );
+
+    let output = lens_cmd(&home, &xdg)
+        .env("CEREBRAS_API_KEY", "fake-cerebras")
+        .env("LENS_API_BASE", server.base_url())
+        .arg("--json")
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg("find")
+        .arg("photo")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--kind")
+        .arg("PHOTO")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = json_stdout(&output);
+    assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
+    assert_eq!(stdout["data"]["searched"], 1);
+    assert_eq!(stdout["data"]["hits"][0]["relPath"], "photo.png");
+}
+
+// F5: duplicate kinds (after clap lowercasing) are deduped in the echoed
+// kindFilter, preserving first-occurrence order.
+#[test]
+fn find_kind_duplicate_filters_are_deduped_in_echo() {
+    let server = MockServer::with(vec![], vec![vec![0]]);
+    let home = temp_root("home-find-kind-dedup");
+    let xdg = temp_root("xdg-find-kind-dedup");
+    let dir = temp_root("library-find-kind-dedup");
+    let index_dir = temp_root("index-find-kind-dedup");
+    write_index_records(
+        &index_dir,
+        &[
+            index_record("photo-0.png", "photo", "photo line zero"),
+            index_record("graphic-0.png", "graphic", "graphic line zero"),
+        ],
+    );
+
+    let output = lens_cmd(&home, &xdg)
+        .env("CEREBRAS_API_KEY", "fake-cerebras")
+        .env("LENS_API_BASE", server.base_url())
+        .arg("--json")
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg("find")
+        .arg("photo")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--kind")
+        .arg("PHOTO,photo")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = json_stdout(&output);
+    // --kind PHOTO,photo → clap lowercases both → dedupe to a single "photo".
+    assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
+    assert_eq!(stdout["data"]["searched"], 1);
+}
+
+// F4: budget-refused + --kind path. Index two kinds; run find --kind photo
+// with a cap below one call's projection. Assert exit 10, outcome refused,
+// kindFilter == ["photo"], searched equals the FILTERED count (not total),
+// and zero requests reached the mock.
+#[test]
+fn find_kind_budget_refused_echoes_filtered_count_without_model_call() {
+    let server = MockServer::start();
+    let home = temp_root("home-find-kind-budget");
+    let xdg = temp_root("xdg-find-kind-budget");
+    let dir = temp_root("library-find-kind-budget");
+    let index_dir = temp_root("index-find-kind-budget");
+    write_index_records(
+        &index_dir,
+        &[
+            index_record("photo-0.png", "photo", "photo desc zero"),
+            index_record("photo-1.png", "photo", "photo desc one"),
+            index_record("graphic-0.png", "graphic", "graphic desc zero"),
+            index_record("graphic-1.png", "graphic", "graphic desc one"),
+        ],
+    );
+    let before = server.request_count();
+
+    let output = lens_cmd(&home, &xdg)
+        .env("CEREBRAS_API_KEY", "fake-cerebras")
+        .env("LENS_API_BASE", server.base_url())
+        .arg("--json")
+        .arg("--max-dollars")
+        .arg("0.000001")
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg("find")
+        .arg("anything")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--kind")
+        .arg("photo")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(10),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = json_stdout(&output);
+    assert_eq!(stdout["ok"], true);
+    assert_eq!(stdout["budget"]["hit"], "dollars");
+    assert_eq!(stdout["data"]["outcome"], "refused");
+    assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
+    // searched is the FILTERED count (2 photos), not the total (4).
+    assert_eq!(stdout["data"]["searched"], 2);
+    assert_eq!(stdout["data"]["hits"].as_array().unwrap().len(), 0);
+    // Zero requests reached the mock.
+    assert_eq!(server.request_count(), before);
+}
+
+// F6: zero-match dry-run on a non-empty fixture index, with NO API key in
+// the env. Exit 0, kindFilter == ["nosuchkind"], searched == 0, warnings
+// contains the exact kind-filter-matched-zero string, zero requests.
+#[test]
+fn find_dry_run_zero_kind_match_no_api_key() {
+    let server = MockServer::start();
+    let home = temp_root("home-find-dry-zero-kind");
+    let xdg = temp_root("xdg-find-dry-zero-kind");
+    let dir = temp_root("library-find-dry-zero-kind");
+    let index_dir = temp_root("index-find-dry-zero-kind");
+    write_index_records(
+        &index_dir,
+        &[
+            index_record("photo.png", "photo", "photo line"),
+            index_record("graphic.png", "graphic", "graphic line"),
+        ],
+    );
+    let before = server.request_count();
+
+    // No CEREBRAS_API_KEY set — dry-run must not require it.
+    let output = lens_cmd(&home, &xdg)
+        .arg("--json")
+        .arg("--dry-run")
+        .arg("--index-path")
+        .arg(&index_dir)
+        .arg("find")
+        .arg("anything")
+        .arg("--dir")
+        .arg(&dir)
+        .arg("--kind")
+        .arg("nosuchkind")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = json_stdout(&output);
+    assert_eq!(
+        stdout["data"]["kindFilter"],
+        serde_json::json!(["nosuchkind"])
+    );
+    assert_eq!(stdout["data"]["searched"], 0);
+    let warnings = stdout["data"]["warnings"].as_array().unwrap();
+    assert!(
+        warnings.iter().any(|w| w.as_str().unwrap()
+            == "kind filter matched 0 of 2 records; kinds present: graphic,photo"),
+        "warnings should contain the exact zero-match string, got: {warnings:?}"
+    );
+    assert_eq!(server.request_count(), before);
 }

@@ -39,6 +39,8 @@ pub struct FindData {
     pub mode: String,
     pub chunks: usize,
     pub warnings: Vec<String>,
+    #[serde(rename = "kindFilter", skip_serializing_if = "Vec::is_empty")]
+    pub kind_filter: Vec<String>,
     /// Count of out-of-range ids dropped from the model's response. Serialized
     /// as `invalidIdsDropped` and skipped when zero (F7).
     #[serde(skip_serializing_if = "is_zero")]
@@ -157,6 +159,7 @@ pub fn find_with_options(
             mode: "single_shot".to_string(),
             chunks: 0,
             warnings: vec!["index is empty; run lens index".to_string()],
+            kind_filter: Vec::new(),
             invalid_ids_dropped: 0,
             gallery_path: None,
         });
@@ -471,6 +474,7 @@ fn data_from_records(
         mode,
         chunks,
         warnings,
+        kind_filter: Vec::new(),
         invalid_ids_dropped,
         gallery_path: None,
     }

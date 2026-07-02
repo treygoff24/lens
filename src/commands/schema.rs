@@ -30,7 +30,7 @@ fn response_schema() -> Value {
             "requestId": {"type": "string"},
             "data": {"oneOf": [
                 {"type": "object", "description": "index report", "properties": {"outcome": {"type": "string"}, "indexed": {"type": "integer"}, "skipped": {"type": "array"}, "failed": {"type": "array"}, "pruned": {"type": "integer"}}},
-                {"type": "object", "description": "find data", "properties": {"query": {"type": "string"}, "hits": {"type": "array"}, "searched": {"type": "integer"}, "mode": {"enum": ["single_shot", "chunked"]}, "chunks": {"type": "integer"}, "warnings": {"type": "array"}, "galleryPath": {"type": "string"}, "outcome": {"type": "string"}, "dryRun": {"type": "boolean"}, "estimatedTokens": {"type": "integer"}, "projectedCostDollars": {"type": "number"}, "invalidIdsDropped": {"type": "integer"}}},
+                {"type": "object", "description": "find data", "properties": {"query": {"type": "string"}, "hits": {"type": "array"}, "searched": {"type": "integer"}, "mode": {"enum": ["single_shot", "chunked"]}, "chunks": {"type": "integer"}, "warnings": {"type": "array"}, "galleryPath": {"type": "string"}, "outcome": {"type": "string"}, "dryRun": {"type": "boolean"}, "estimatedTokens": {"type": "integer"}, "projectedCostDollars": {"type": "number"}, "invalidIdsDropped": {"type": "integer"}, "kindFilter": {"type": "array", "items": {"type": "string"}}}},
                 {"type": "object", "description": "status", "properties": {"libraryPath": {"type": "string"}, "indexPath": {"type": "string"}, "indexed": {"type": "integer"}, "fresh": {"type": "integer"}, "stale": {"type": "integer"}, "new": {"type": "integer"}, "vanished": {"type": "integer"}, "staleAll": {"type": "boolean"}}},
                 {"type": "object", "description": "doctor report", "properties": {"schemaVersion": {"type": "string"}, "status": {"enum": ["healthy", "degraded", "broken"]}, "summary": {"type": "object"}, "checks": {"type": "array"}, "runId": {"type": ["string", "null"]}}},
                 {"type": "object", "description": "capabilities payload"},
@@ -109,5 +109,7 @@ mod tests {
             props.get("invalidIdsDropped").is_some(),
             "missing invalidIdsDropped"
         );
+        // F1: kindFilter (array of strings, omitted when empty).
+        assert!(props.get("kindFilter").is_some(), "missing kindFilter");
     }
 }

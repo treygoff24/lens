@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 pub struct MockServer {
     base_url: String,
     requests: Arc<AtomicUsize>,
+    last_request_body: Arc<Mutex<Option<String>>>,
     running: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -58,6 +59,7 @@ impl MockServer {
         let addr = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let running = Arc::new(AtomicBool::new(true));
+        let last_request_body: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let state = Arc::new(MockState {
             captions: Mutex::new(captions.into_iter().map(str::to_string).collect()),
             find_ids: Mutex::new(find_ids),
@@ -67,12 +69,13 @@ impl MockServer {
         let thread_requests = Arc::clone(&requests);
         let thread_running = Arc::clone(&running);
         let thread_state = Arc::clone(&state);
+        let thread_last_body = Arc::clone(&last_request_body);
         let handle = thread::spawn(move || {
             while thread_running.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         thread_requests.fetch_add(1, Ordering::SeqCst);
-                        handle_client(stream, &thread_state);
+                        handle_client(stream, &thread_state, &thread_last_body);
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -85,6 +88,7 @@ impl MockServer {
         Self {
             base_url: format!("http://{addr}"),
             requests,
+            last_request_body,
             running,
             handle: Some(handle),
         }
@@ -96,6 +100,12 @@ impl MockServer {
 
     pub fn request_count(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
+    }
+
+    /// Returns the raw body of the most recent request received by the mock,
+    /// or `None` if no request has been received yet.
+    pub fn last_request_body(&self) -> Option<String> {
+        self.last_request_body.lock().unwrap().clone()
     }
 }
 
@@ -109,10 +119,17 @@ impl Drop for MockServer {
     }
 }
 
-fn handle_client(mut stream: TcpStream, state: &MockState) {
+fn handle_client(
+    mut stream: TcpStream,
+    state: &MockState,
+    last_request_body: &Mutex<Option<String>>,
+) {
     let Ok((path, body, headers)) = read_request(&mut stream) else {
         return;
     };
+    if let Ok(mut guard) = last_request_body.lock() {
+        *guard = Some(body.clone());
+    }
     if headers
         .lines()
         .any(|line| line.eq_ignore_ascii_case("authorization: bearer bad-cerebras"))
