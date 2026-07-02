@@ -13,7 +13,7 @@ Legend: `[x]` done · `[ ]` open · `[~]` open, decision recorded below
 
 - [x] **Decision: GitHub-first distribution.** The crates.io name `lens` is taken (an unrelated
   "unified lens query language" crate). Rather than rename, v0.1.0 installs via
-  `cargo install --git https://github.com/treygoff/lens` (or clone + `cargo install --path .`).
+  `cargo install --git https://github.com/treygoff24/lens` (or clone + `cargo install --path .`).
   Publishing to crates.io as `lens-cli` (with `[[bin]] name = "lens"`) stays a documented option —
   see §8. Owner can overrule at any time; nothing else depends on this.
 
@@ -88,7 +88,7 @@ Legend: `[x]` done · `[ ]` open · `[~]` open, decision recorded below
 - [x] Independent review lane (different model family) over the full uncommitted diff;
   every finding triaged in writing; fixes verified landed.
 - [ ] Commit(s) with review provenance in the message.
-- [ ] Create public repo `treygoff/lens`, push `main`.
+- [ ] Create public repo `treygoff24/lens`, push `main`.
 - [ ] Confirm CI green on the public repo.
 - [ ] Repo description + topics (`cli`, `rust`, `image-search`, `ai-agents`, `cerebras`).
 - [ ] Tag `v0.1.0`.

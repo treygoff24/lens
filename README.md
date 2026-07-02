@@ -1,6 +1,6 @@
 # lens
 
-[![CI](https://github.com/treygoff/lens/actions/workflows/ci.yml/badge.svg)](https://github.com/treygoff/lens/actions/workflows/ci.yml)
+[![CI](https://github.com/treygoff24/lens/actions/workflows/ci.yml/badge.svg)](https://github.com/treygoff24/lens/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 Natural-language search for image libraries, built for AI agents.
@@ -16,7 +16,7 @@ Measured on a real 1,100-image library: indexed in 93 seconds for $2.29, zero fa
 Requires Rust 1.85+ (edition 2024). Not yet on crates.io (the `lens` name is taken):
 
 ```sh
-cargo install --git https://github.com/treygoff/lens
+cargo install --git https://github.com/treygoff24/lens
 # or from a clone:
 cargo install --path .
 ```
@@ -179,7 +179,7 @@ The design doc — including the adversarial design review and its accepted/reje
 
 ## Provenance
 
-lens was designed, built, reviewed, and shipped almost entirely by [Claude](https://claude.com/claude-code) (Anthropic's Fable 5 and friends, with Codex and Cursor lanes as adversarial reviewers), coordinated through a multi-model build loop. The human in the loop is [Trey Goff](https://github.com/treygoff), who mostly said "yes," "ship it," and paid for the tokens. Every cost and performance number in this README was measured on real runs, not asserted.
+lens was designed, built, reviewed, and shipped almost entirely by [Claude](https://claude.com/claude-code) (Anthropic's Fable 5 and friends, with Codex and Cursor lanes as adversarial reviewers), coordinated through a multi-model build loop. The human in the loop is [Trey Goff](https://github.com/treygoff24), who mostly said "yes," "ship it," and paid for the tokens. Every cost and performance number in this README was measured on real runs, not asserted.
 
 Sibling project: same envelope contract and exit-code dictionary as `recon` (agent-first web recon CLI).
 
