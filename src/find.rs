@@ -13,7 +13,13 @@ use crate::providers::{SharedSpend, Spend};
 use crate::store::IndexRecord;
 
 const FIND_MAX_COMPLETION_TOKENS: u64 = 200;
-const CHUNK_TOKEN_CAP: usize = 70_000;
+/// Estimated-token budget per model call. `estimate_tokens` is deliberately
+/// conservative (bytes/3 ≈ 1.3× real tokens for this line format, measured
+/// live 2026-07-01: the 1,100-image corpus estimates 92K but is ~70K real),
+/// so 100K estimated ≈ 75-77K real — comfortable margin under the 131K
+/// context window. At 70K the same corpus was needlessly chunked: 2× cost,
+/// no byte-stable prefix, no prompt-cache hit on repeat queries.
+const CHUNK_TOKEN_CAP: usize = 100_000;
 const GEMMA_INPUT_PER_MTOK: f64 = 2.15;
 const GEMMA_OUTPUT_PER_MTOK: f64 = 2.70;
 /// Maximum description chars in a serialized index line. Normal captions are
@@ -722,9 +728,9 @@ mod tests {
     fn chunked_find_resolves_rerank_ids_against_union_snapshot() {
         // Build records large enough to force 3+ chunks.
         // With the F5 description clamp (2,000 chars), each line is ~2,170
-        // bytes → ~723 tokens. Need >194 records for 3 chunks (each ~70K
-        // tokens). Use 210 for at least 3 chunks of ~70.
-        let records: Vec<IndexRecord> = (0..210)
+        // bytes → ~723 estimated tokens. Need >277 records for 3 chunks
+        // (each ≤100K estimated tokens). Use 450 for at least 3 chunks.
+        let records: Vec<IndexRecord> = (0..450)
             .map(|i| {
                 rec(
                     &format!("file_{i:03}.jpg"),
