@@ -87,11 +87,11 @@ Legend: `[x]` done · `[ ]` open · `[~]` open, decision recorded below
 
 - [x] Independent review lane (different model family) over the full uncommitted diff;
   every finding triaged in writing; fixes verified landed.
-- [ ] Commit(s) with review provenance in the message.
-- [ ] Create public repo `treygoff24/lens`, push `main`.
-- [ ] Confirm CI green on the public repo.
-- [ ] Repo description + topics (`cli`, `rust`, `image-search`, `ai-agents`, `cerebras`).
-- [ ] Tag `v0.1.0`.
+- [x] Commit(s) with review provenance in the message.
+- [x] Create public repo `treygoff24/lens`, push `main`.
+- [x] Confirm CI green on the public repo.
+- [x] Repo description + topics (`cli`, `rust`, `image-search`, `ai-agents`, `cerebras`).
+- [x] Tag `v0.1.0`.
 
 ## 8. Post-launch backlog (documented, deliberately not v1)
 
