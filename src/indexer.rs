@@ -20,6 +20,7 @@ use crate::walk::{WalkedFile, partition_freshness, walk_library};
 pub const CAPTION_WORST_CASE_COST: f64 = 0.008;
 pub const DEFAULT_INDEX_CONCURRENCY: usize = 25;
 const PROMPT: &str = "Index this image for a searchable photo library. Transcribe any legible text verbatim into text_content (truncate past ~100 words).";
+const TERSE_PROMPT: &str = "Index this image for a searchable photo library. This image is text-dense: put only the first ~50 words of legible text in text_content and keep description to two sentences. The JSON must be complete.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,15 +93,23 @@ impl IndexOptions {
 }
 
 pub trait CaptionChat: Sync {
-    fn caption_chat(&self, jpeg_bytes: &[u8]) -> Result<ChatResponse, LensError>;
+    /// `terse` selects the bounded-transcription prompt used on re-rolls:
+    /// text-dense images (brochures, infographics) can blow the completion cap
+    /// mid-JSON on the full prompt, which parses as truncated JSON every time.
+    /// Measured live 2026-07-01: 29/1,100 corpus images failed deterministically
+    /// until the terse re-roll was added. Does not bump promptVersion — the
+    /// primary prompt is unchanged and terse mode only runs for files that
+    /// previously produced no index row at all.
+    fn caption_chat(&self, jpeg_bytes: &[u8], terse: bool) -> Result<ChatResponse, LensError>;
     fn spend_snapshot(&self) -> Spend;
 }
 
 impl CaptionChat for CerebrasClient {
-    fn caption_chat(&self, jpeg_bytes: &[u8]) -> Result<ChatResponse, LensError> {
+    fn caption_chat(&self, jpeg_bytes: &[u8], terse: bool) -> Result<ChatResponse, LensError> {
         let data_uri = format!("data:image/jpeg;base64,{}", STANDARD.encode(jpeg_bytes));
+        let prompt = if terse { TERSE_PROMPT } else { PROMPT };
         self.chat(
-            &[Message::user_with_image(PROMPT, data_uri)],
+            &[Message::user_with_image(prompt, data_uri)],
             ChatOpts {
                 max_completion_tokens: Some(1200),
                 response_format: Some(caption_response_format()),
@@ -395,9 +404,12 @@ fn caption_normalized(
     jpeg_bytes: &[u8],
     chat: &dyn CaptionChat,
 ) -> Result<CaptionPayload, CaptionFailure> {
-    match chat.caption_chat(jpeg_bytes) {
+    match chat.caption_chat(jpeg_bytes, false) {
         Ok(response) => parse_caption(&response.content).or_else(|_| {
-            chat.caption_chat(jpeg_bytes)
+            // Parse failure is dominated by cap-truncated transcriptions of
+            // text-dense images; the terse prompt bounds the output so the
+            // re-roll can complete.
+            chat.caption_chat(jpeg_bytes, true)
                 .map_err(map_caption_error)
                 .and_then(|reroll| parse_caption(&reroll.content))
         }),
@@ -467,6 +479,7 @@ mod tests {
     struct ScriptedChat {
         responses: Mutex<VecDeque<Result<String, LensError>>>,
         calls: AtomicUsize,
+        terse_calls: AtomicUsize,
         spend: Mutex<Spend>,
     }
 
@@ -475,14 +488,18 @@ mod tests {
             Self {
                 responses: Mutex::new(VecDeque::from(responses)),
                 calls: AtomicUsize::new(0),
+                terse_calls: AtomicUsize::new(0),
                 spend: Mutex::new(Spend::default()),
             }
         }
     }
 
     impl CaptionChat for ScriptedChat {
-        fn caption_chat(&self, _jpeg_bytes: &[u8]) -> Result<ChatResponse, LensError> {
+        fn caption_chat(&self, _jpeg_bytes: &[u8], terse: bool) -> Result<ChatResponse, LensError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if terse {
+                self.terse_calls.fetch_add(1, Ordering::SeqCst);
+            }
             let mut spend = self.spend.lock().unwrap();
             spend.call_count += 1;
             spend.prompt_tokens += 10;
@@ -561,6 +578,8 @@ mod tests {
 
         assert_eq!(outcome.report().indexed, 1);
         assert_eq!(chat.calls.load(Ordering::SeqCst), 2);
+        // The re-roll must use the terse prompt (cap-truncation defense).
+        assert_eq!(chat.terse_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
