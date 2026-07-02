@@ -113,6 +113,12 @@ impl CaptionChat for CerebrasClient {
             ChatOpts {
                 max_completion_tokens: Some(1200),
                 response_format: Some(caption_response_format()),
+                // Terse re-rolls also drop temperature: default-temp decoding
+                // degenerates into repetition loops (". . .", "\n\n\n") or
+                // hallucinated marketing copy on some photos until the token
+                // cap truncates the JSON. Measured live 2026-07-01: temp 0.4
+                // cleared 3/3 attempts on an image that failed 3/3 at default.
+                temperature: terse.then_some(0.4),
                 ..ChatOpts::default()
             },
         )
@@ -405,19 +411,85 @@ fn caption_normalized(
     chat: &dyn CaptionChat,
 ) -> Result<CaptionPayload, CaptionFailure> {
     match chat.caption_chat(jpeg_bytes, false) {
-        Ok(response) => parse_caption(&response.content).or_else(|_| {
-            // Parse failure is dominated by cap-truncated transcriptions of
-            // text-dense images; the terse prompt bounds the output so the
-            // re-roll can complete.
-            chat.caption_chat(jpeg_bytes, true)
-                .map_err(map_caption_error)
-                .and_then(|reroll| parse_caption(&reroll.content))
-        }),
+        Ok(response) => match parse_caption(&response.content) {
+            Ok(caption) => Ok(caption),
+            Err(_) => {
+                // Parse failure is dominated by cap-truncated output: either a
+                // text-dense image transcribed past the cap, or a degeneration
+                // loop (model hallucinates repeating text in photo texture).
+                // The terse prompt + low temperature clears the first class.
+                let reroll = chat
+                    .caption_chat(jpeg_bytes, true)
+                    .map_err(map_caption_error)?;
+                parse_caption(&reroll.content).or_else(|err| {
+                    // Last resort for images that loop on every attempt: both
+                    // responses reliably open with a good description string
+                    // before degenerating. Salvage it into a degraded row —
+                    // an honest thin record beats a permanent failure.
+                    salvage_caption(&reroll.content)
+                        .or_else(|| salvage_caption(&response.content))
+                        .ok_or(err)
+                })
+            }
+        },
         Err(err) if err.to_string().contains("invalid_image_data") => {
             Err(CaptionFailure::InvalidImageData)
         }
         Err(err) => Err(map_caption_error(err)),
     }
+}
+
+/// Extracts a usable record from a cap-truncated caption response. Requires a
+/// complete-enough `"description": "..."` opening; everything else defaults.
+fn salvage_caption(content: &str) -> Option<CaptionPayload> {
+    let repaired = json_repair(content);
+    let start = repaired.find("\"description\"")?;
+    let after_key = &repaired[start + "\"description\"".len()..];
+    let quote = after_key.find('"')?;
+    let body = &after_key[quote + 1..];
+    // Scan to the closing quote, honoring escapes; on truncation take what we have.
+    let mut end = body.len();
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                let _ = chars.next();
+            }
+            '"' => {
+                end = i;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let mut description: String = body[..end].chars().take(500).collect();
+    // A truncated tail can end mid-escape; drop trailing backslashes.
+    while description.ends_with('\\') {
+        description.pop();
+    }
+    let description = description.trim().to_string();
+    if description.len() < 20 {
+        return None;
+    }
+    let filename = description
+        .split_whitespace()
+        .take(6)
+        .map(|word| {
+            word.chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .collect::<String>()
+                .to_lowercase()
+        })
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    Some(CaptionPayload {
+        description,
+        filename,
+        tags: Vec::new(),
+        text_content: String::new(),
+        kind: "photo".to_string(),
+    })
 }
 
 fn map_caption_error(err: LensError) -> CaptionFailure {
@@ -580,6 +652,37 @@ mod tests {
         assert_eq!(chat.calls.load(Ordering::SeqCst), 2);
         // The re-roll must use the terse prompt (cap-truncation defense).
         assert_eq!(chat.terse_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn salvage_extracts_description_from_truncated_response() {
+        let truncated = r#"{"description": "High-angle aerial view of a luxury resort with pools", "filename": "resort", "tags": ["a"], "text_content": "LUXURY RESORT LUXURY RESORT LUXURY RES"#;
+        let payload = salvage_caption(truncated).unwrap();
+        assert_eq!(
+            payload.description,
+            "High-angle aerial view of a luxury resort with pools"
+        );
+        assert_eq!(payload.filename, "highangle-aerial-view-of-a-luxury");
+        assert_eq!(payload.kind, "photo");
+        assert!(payload.tags.is_empty());
+        assert!(payload.text_content.is_empty());
+
+        assert!(salvage_caption("not json at all").is_none());
+        assert!(salvage_caption(r#"{"description": "too short"#).is_none());
+    }
+
+    #[test]
+    fn double_parse_fail_with_salvageable_description_indexes_degraded_row() {
+        let dir = fixture_library(1);
+        let truncated = r#"{"description": "An aerial photo of winding blue pools beside the ocean", "text_content": ". . . . . . . ."#;
+        let chat = ScriptedChat::new(vec![
+            Ok("not json".into()),
+            Ok(truncated.into()), // re-roll also fails to parse → salvage
+        ]);
+        let outcome = run(dir.path(), &chat, &Budget::new(None, None));
+
+        assert_eq!(outcome.report().indexed, 1);
+        assert_eq!(outcome.report().failed.len(), 0);
     }
 
     #[test]
