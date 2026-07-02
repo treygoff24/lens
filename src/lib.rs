@@ -1,7 +1,10 @@
 pub mod budget;
+pub mod cli;
+pub mod commands;
 pub mod config;
 pub mod envelope;
 pub mod error;
+pub mod find;
 pub mod indexer;
 pub mod normalize;
 pub mod providers;

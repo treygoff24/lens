@@ -108,13 +108,18 @@ impl Store {
     ///   SIGKILL, the lock file is not cleaned up and the next writer must wait
     ///   out the 30-minute staleness window (or the user deletes the file, as
     ///   the suggestedFix advises).
-    pub fn lock(&self) -> Result<StoreLock, LensError> {
+    ///
+    /// Returns `(StoreLock, Option<String>)` where the `Option<String>` is a
+    /// warning message (e.g. when a stale lock is stolen). In JSON mode the
+    /// caller routes this into the envelope's `warnings` instead of writing to
+    /// raw stderr (F2+F3).
+    pub fn lock(&self) -> Result<(StoreLock, Option<String>), LensError> {
         let path = self.lock_path();
         match create_lock_file(&path) {
-            Ok(()) => Ok(StoreLock { path }),
+            Ok(()) => Ok((StoreLock { path }, None)),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                 if lock_is_stale(&path)? {
-                    eprintln!("warning: stealing stale index lock {}", path.display());
+                    let warning = format!("stealing stale index lock {}", path.display());
                     let _ = fs::remove_file(&path);
                     // F6: a concurrent stealer that loses the race hits
                     // AlreadyExists here. Map it to the same "index is already
@@ -127,7 +132,7 @@ impl Store {
                             lock_error(&path, err)
                         }
                     })?;
-                    Ok(StoreLock { path })
+                    Ok((StoreLock { path }, Some(warning)))
                 } else {
                     Err(lock_busy_error(&path))
                 }
@@ -554,7 +559,7 @@ mod tests {
     fn lock_conflict_young_errors_with_fix() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_at(dir.path()).unwrap();
-        let _lock = store.lock().unwrap();
+        let (_lock, _warning) = store.lock().unwrap();
 
         let err = store.lock().unwrap_err();
         assert_eq!(err.exit_code(), 3);
@@ -562,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_lock_is_stolen() {
+    fn stale_lock_is_stolen_with_warning() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_at(dir.path()).unwrap();
         fs::write(store.lock_path(), "old").unwrap();
@@ -572,7 +577,9 @@ mod tests {
         old.set_times(stale).unwrap();
         drop(old);
 
-        let _lock = store.lock().unwrap();
+        let (_lock, warning) = store.lock().unwrap();
+        assert!(warning.is_some());
+        assert!(warning.unwrap().contains("stealing stale index lock"));
     }
 
     #[test]

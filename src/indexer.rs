@@ -36,6 +36,11 @@ pub struct IndexReport {
     pub stale: usize,
     pub new: usize,
     pub vanished: usize,
+    /// Warnings collected during the run (store-load warnings, stale_all
+    /// notice, lock-steal warning). In JSON mode these ride the envelope
+    /// instead of raw stderr (F2+F3).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,15 +125,20 @@ pub fn index_library(
     options: &IndexOptions,
 ) -> Result<IndexOutcome, LensError> {
     let start = Instant::now();
-    let _lock = store.lock()?;
+    let (_lock, lock_warning) = store.lock()?;
+
+    // F2+F3: collect warnings into a Vec<String> instead of eprintln. The
+    // commands layer decides whether to print them to stderr (human mode only).
+    let mut warnings = Vec::new();
+    if let Some(w) = lock_warning {
+        warnings.push(w);
+    }
 
     let walked = walk_library(library_path)?;
     let loaded = store.load(&options.model)?;
-    for warning in loaded.warnings {
-        eprintln!("warning: {warning}");
-    }
+    warnings.extend(loaded.warnings);
     if loaded.stale_all {
-        eprintln!("warning: index metadata is stale; recaptioning all files");
+        warnings.push("index metadata is stale; recaptioning all files".to_string());
     }
 
     // Always partition so we know which files truly vanished from the library
@@ -191,6 +201,7 @@ pub fn index_library(
         stale: freshness.stale.len(),
         new: freshness.new.len(),
         vanished: freshness.vanished.len(),
+        warnings,
     };
 
     if run.budget_hit {
