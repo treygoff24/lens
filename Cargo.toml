@@ -2,6 +2,13 @@
 name = "lens"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Agent-first CLI for natural-language image-library search: caption once with Cerebras vision, then search the whole index in one model call."
+license = "Apache-2.0"
+repository = "https://github.com/treygoff/lens"
+readme = "README.md"
+keywords = ["cli", "image-search", "ai-agents", "vision", "cerebras"]
+categories = ["command-line-utilities", "multimedia::images"]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }

@@ -1,75 +1,58 @@
 # lens
 
-`lens` is an agent-first Rust CLI for image-library search. It indexes images with Cerebras vision captions, stores a JSONL index under the user data dir, then answers natural-language image queries from that index. Stdout is reserved for success envelopes. Stderr is reserved for error envelopes. There are no prompts, colors, spinners, or implicit query mode.
+[![CI](https://github.com/treygoff/lens/actions/workflows/ci.yml/badge.svg)](https://github.com/treygoff/lens/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-## Contract
+Natural-language search for image libraries, built for AI agents.
 
-Commands are explicit:
+`lens` captions every image in a directory once with a fast vision model (Cerebras `gemma-4-31b`), stores the captions as a plain JSONL file, then answers queries like *"the hero shot of the beach club"* in seconds — by putting the **entire index into a single model call**. No vector database, no embedding service, no daemon. The index is one file; search is one request.
+
+Measured on a real 1,100-image library: indexed in 93 seconds for $2.29, zero failures; searches answered in 2–6 seconds for ~$0.20 each.
+
+`lens` is agent-first: stdout carries exactly one JSON success envelope, stderr exactly one JSON error envelope, exit codes are a stable dictionary, and every error includes a paste-ready `suggestedFix`. There are no prompts, colors, spinners, or implicit modes. Humans are welcome too — `find --gallery` writes an HTML contact sheet for eyeballs.
+
+## Install
+
+Requires Rust 1.85+ (edition 2024). Not yet on crates.io (the `lens` name is taken):
+
+```sh
+cargo install --git https://github.com/treygoff/lens
+# or from a clone:
+cargo install --path .
+```
+
+## Quickstart
+
+```sh
+export CEREBRAS_API_KEY=...   # get one at https://cloud.cerebras.ai
+
+lens --json index ./photos                      # caption + index (spends money, resumable)
+lens --json find "beach club hero shot" --dir ./photos --top 3
+lens --json status --dir ./photos               # free, offline: what's indexed/stale, cost to bring current
+```
+
+Always know the cost before you spend: every paid command supports `--dry-run` (zero network, closed-form projection) and `--max-dollars` / `--max-seconds` hard caps.
+
+## Commands
 
 ```sh
 lens index [DIR]
-lens find <QUERY> [--dir DIR] [--top N] [--gallery PATH]
+lens find <QUERY> [--dir DIR] [--top N] [--kind KIND] [--gallery PATH]
 lens status [--dir DIR]
 lens doctor [--online]
 lens capabilities
 lens schema [response|error|all]
 ```
 
-Global flags are `--json`, `--model`, `--max-dollars`, `--max-seconds`, `--index-path`, `--dry-run`, and `--concurrency N`. `--concurrency` is capped at 50 and is used by indexing and chunked find.
+Global flags: `--json`, `--model`, `--max-dollars`, `--max-seconds`, `--index-path`, `--dry-run`, and `--concurrency N` (capped at 50; used by indexing and chunked find).
 
-## Install
+`find --kind photo` filters the index to records of the given kinds (repeatable or comma-separated: `--kind photo,screenshot`) before anything is sent to the model — improving precision when you want photographs rather than renders or screenshots, and cutting input tokens. Kinds come from the caption model's open vocabulary (`photo`, `graphic`, `screenshot`, `document`, …); the applied filter is echoed back as `kindFilter` in the envelope.
 
-```sh
-cargo install --path .
-```
+## How it works
 
-## Environment
+**Indexing** walks the directory deterministically, skips unchanged files via a `(relPath, size, mtime)` freshness key, normalizes each image (≤1600px JPEG in memory — nothing is written except the index), and fans captions out across 25 concurrent workers. Every model call passes a budget reservation gate first, so parallel workers cannot overshoot `--max-dollars`. Results append to the index as they land: a killed run resumes exactly where it stopped.
 
-| Variable | Required for | Default |
-| --- | --- | --- |
-| `CEREBRAS_API_KEY` | `index`, `find`, `doctor --online` | none |
-| `LENS_API_BASE` | Cerebras-compatible API base | `https://api.cerebras.ai/v1` |
-| `LENS_MODEL` | model default | `gemma-4-31b` |
-| `LENS_MAX_CONCURRENCY` | chunk/search worker default | `25` |
-| `XDG_DATA_HOME` | index storage root | `~/.local/share` |
-
-## Canonical use
-
-```sh
-lens --json index ./photos
-lens --json find "beach club hero shot" --dir ./photos --top 3
-```
-
-Example index envelope:
-
-```json
-{
-  "schema": "lens.cli.response.v1",
-  "ok": true,
-  "command": "index",
-  "requestId": "00000000-0000-0000-0000-000000000000",
-  "data": {
-    "libraryPath": "/tmp/photos",
-    "indexed": 2,
-    "skipped": [],
-    "failed": [],
-    "pruned": 0,
-    "budget": { "hit": null },
-    "durationMs": 120,
-    "totalFiles": 2,
-    "fresh": 0,
-    "stale": 0,
-    "new": 2,
-    "vanished": 0,
-    "outcome": "complete"
-  },
-  "costDollars": { "model": 0.0097, "search": 0.0, "total": 0.0097, "estimated": false },
-  "budget": { "hit": null },
-  "diagnostics": { "durationMs": 120, "retries": 0 }
-}
-```
-
-> **Note:** `IndexReport` duplicates `budget` and `durationMs` inside `data` (from the report struct) alongside the envelope-level `budget` and `diagnostics.durationMs`. Both are kept for backward compatibility; the envelope-level fields are the canonical ones.
+**Search** loads the index, dedupes and sorts it into a deterministic snapshot, and serializes one line per image. Small enough (≤100K estimated tokens), it goes to the model in one shot with the index as a byte-stable prompt prefix; the model returns matching line ids. Bigger libraries split into chunks searched in parallel, and one rerank call over the union picks the final ranking — two model rounds, still seconds.
 
 Example find envelope:
 
@@ -96,7 +79,6 @@ Example find envelope:
     "mode": "single_shot",
     "chunks": 1,
     "warnings": [],
-    "invalidIdsDropped": 0,
     "outcome": "answered"
   },
   "costDollars": { "model": 0.00485, "search": 0.0, "total": 0.00485, "estimated": false },
@@ -106,6 +88,22 @@ Example find envelope:
 ```
 
 `--dry-run` returns the same envelope family with `data.dryRun: true` and `costDollars.estimated: true`. It makes no provider requests and does not require `CEREBRAS_API_KEY`.
+
+## Cost and performance expectations
+
+All numbers measured, not projected, unless marked:
+
+| What | Measured |
+| --- | --- |
+| Index 1,100 images (real-estate/aerial corpus) | 93s, $2.29, 0 failures |
+| Find, 1,100-image index (2 chunks) | 2–6s, ~$0.20 per query |
+| Caption cost, average | $0.00166/image (budget gate reserves a worst-case $0.008) |
+
+Sizing: whether a library fits the cheap single-shot path depends on caption richness, not just image count. Terse captions serialize at ~65 estimated tokens per image (≈1,500 images per 100K-token call); rich captions (detailed scenes + OCR text) run ~140 (≈700 images). Beyond that, `find` chunks automatically — cost grows linearly with index size, since every query pushes the whole index through the model. `find --dry-run` tells you which path a query will take and its projected cost.
+
+Prompt caching on Cerebras is a **latency** feature, not a price discount: cached input tokens bill at the full input rate ([their docs are explicit](https://inference-docs.cerebras.ai/capabilities/prompt-caching)). Repeat queries against an unchanged index are noticeably faster (measured 5.9s → 1.8s), never cheaper. Pricing basis: gemma-4-31b at $2.15/M input, $2.70/M output tokens.
+
+Rate limits (Cerebras developer tier): 300 requests/minute, 500K tokens/minute. The indexer's default concurrency of 25 intentionally rides above the sustained rate and absorbs 429s with retry/backoff — the 1,100-image run retried 50 times (4.5%) and still finished in 93s. Free-trial keys have much lower limits (and a 65K context window vs 131K paid), so expect indexing to be slower there.
 
 ## Exit codes
 
@@ -123,45 +121,68 @@ Example find envelope:
 
 Exit 10 is deliberate. `index` is resumable, so a budget-hit partial index is durable progress. `find` has no useful partial result, so a budget refusal returns `data.outcome: "refused"`, empty `hits`, `budget.hit`, and exit 10.
 
-## Skip reasons
+Per-file caption failures and skips (`unsupported_format`, `corrupt_image`, `too_large`, `budget_refused`) are reported inside the success envelope; they do not fail an `index` run.
 
-| Reason | Meaning |
-| --- | --- |
-| `unsupported_format` | format is not handled by the Rust decoder or `sips` fallback |
-| `corrupt_image` | decode or fallback conversion failed |
-| `too_large` | image exceeds decode or payload limits |
-| `budget_refused` | budget gate refused to launch another model call |
+## Environment
 
-Skips and per-file failures are reported in the success envelope. They do not make `index` fail.
+| Variable | Required for | Default |
+| --- | --- | --- |
+| `CEREBRAS_API_KEY` | `index`, `find` (live calls only — `--dry-run` and zero-match filters need no key), `doctor --online` | none |
+| `LENS_API_BASE` | Cerebras-compatible API base | `https://api.cerebras.ai/v1` |
+| `LENS_MODEL` | model default | `gemma-4-31b` |
+| `LENS_MAX_CONCURRENCY` | chunk/search worker default | `25` |
+| `XDG_DATA_HOME` | index storage root | `~/.local/share` |
 
 ## Index storage and locking
 
-Default storage is:
+Libraries can be read-only; the index lives outside the library, keyed by the canonicalized path:
 
 ```text
 ${XDG_DATA_HOME:-~/.local/share}/lens/libraries/<sha256(canonical_path)[..16]>/
-  meta.json
-  index.jsonl
-  index.lock
+  meta.json      # model, promptVersion, normalizerVersion, schemaVersion — any mismatch marks the index stale
+  index.jsonl    # one record per image
+  index.lock     # advisory single-writer lock
 ```
 
-`--index-path PATH` overrides the store directory. Libraries can be read-only; the index is outside the library by default. `lens index` takes a per-library advisory `index.lock` with `create_new`. A lock older than 30 minutes is treated as stale and may be stolen. Fresh lock conflicts exit 3 with a suggested fix naming the lock path.
+`--index-path PATH` overrides the store directory. `lens index` takes a per-library advisory lock (`create_new`); a fresh conflict exits 3 naming the lock path, and a lock older than 30 minutes is treated as stale and stolen with a warning. Index loading tolerates one torn trailing line, so a hard kill mid-append cannot corrupt reads.
 
-## Cost expectations
+## Platform support
 
-Prototype measurements: 1,128 images indexed in about 45 seconds for about $1.87. Search was about 1 second with a cached whole-index prompt prefix. The indexer uses a worst-case projection of `$0.008` per captioned image. Find cost is projected from serialized index bytes at the Gemma input price plus 200 output tokens, so larger indexes cost more.
+- **macOS** — full support. HEIC and decode failures fall back to `sips` conversion.
+- **Linux** — works; pure-Rust decoding covers jpg/png/webp/gif/bmp/tiff. There is no `sips`, so HEIC files and decode-fallback cases are recorded as `unsupported_format` / `corrupt_image` skips instead of being converted. Runs never fail because of them.
+- **Windows** — untested, unsupported (v1 non-goal).
 
 ## Doctor and self-description
 
 ```sh
-lens doctor --json
-lens doctor --online --json
-lens capabilities --json
-lens schema all --json
-lens schema response --json
-lens schema error --json
+lens doctor --json            # offline: config, key presence, sips availability, storage writability
+lens doctor --online --json   # adds a one-token Cerebras probe; bad key exits 2 but still reports
+lens capabilities --json      # commands, flags, spend/read-only annotations, exit codes, env vars
+lens schema all --json        # JSON Schema for success and error envelopes
 ```
 
-Offline doctor checks config parsing, key presence, `sips` availability, and index data-dir writability. It never prints secret values. `--online` adds a one-token Cerebras chat probe. Bad or missing online credentials exit 2, but doctor still emits its report on stdout.
+Doctor never prints secret values.
 
-`capabilities` returns version, commands, read-only/destructive/spend annotations, global flags, exit codes, env vars, skip reasons, and cost expectations. `schema` returns JSON Schema for success and error envelopes.
+## Development
+
+```sh
+cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test && cargo build --release
+```
+
+Integration tests run the real binary against a local mock Cerebras server — no API key or network needed, which is also how CI runs. For diagnosing caption failures against the live API there's a diagnosis harness:
+
+```sh
+CEREBRAS_API_KEY=... cargo run --release --example debug_caption -- path/to/image.jpg
+```
+
+The design doc — including the adversarial design review and its accepted/rejected findings — is at [`docs/plans/2026-07-01-lens-cli-design.md`](docs/plans/2026-07-01-lens-cli-design.md).
+
+## Provenance
+
+lens was designed, built, reviewed, and shipped almost entirely by [Claude](https://claude.com/claude-code) (Anthropic's Fable 5 and friends, with Codex and Cursor lanes as adversarial reviewers), coordinated through a multi-model build loop. The human in the loop is [Trey Goff](https://github.com/treygoff), who mostly said "yes," "ship it," and paid for the tokens. Every cost and performance number in this README was measured on real runs, not asserted.
+
+Sibling project: same envelope contract and exit-code dictionary as `recon` (agent-first web recon CLI).
+
+## License
+
+Apache-2.0
