@@ -95,8 +95,9 @@ Legend: `[x]` done · `[ ]` open · `[~]` open, decision recorded below
 
 ## 8. Post-launch backlog (documented, deliberately not v1)
 
-- Binary releases (cargo-dist) so non-Rust users skip the toolchain.
-- crates.io publication as `lens-cli` if `cargo install lens-cli` demand shows up.
+- ~~Binary releases (cargo-dist)~~ — SHIPPED 2026-07-03 (v0.1.1): dist builds 4 platform
+  tarballs + shell installer + Homebrew formula (`brew install treygoff24/tap/lens`) on tag push.
+- ~~crates.io publication as `lens-cli`~~ — SHIPPED 2026-07-03: `cargo install lens-cli` is live.
 - Cached-token cost accounting if/when Cerebras documents a caching discount.
 - Local lexical pre-filter stage for 30K+ image libraries (the economic ceiling of
   whole-index-in-prompt; design doc non-goal, real v2 seam).
