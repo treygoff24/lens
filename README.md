@@ -1,25 +1,41 @@
-# lens
+<p align="center">
+  <img src="assets/cover.jpg" alt="lens — natural-language search for image libraries" width="100%">
+</p>
 
-[![CI](https://github.com/treygoff24/lens/actions/workflows/ci.yml/badge.svg)](https://github.com/treygoff24/lens/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+<h1 align="center">lens</h1>
 
-Natural-language search for image libraries, built for AI agents.
+<p align="center"><b>Ask for a photo the way you'd ask a person. Get it in seconds.</b></p>
 
-`lens` captions every image in a directory once with a fast vision model (Cerebras `gemma-4-31b`), stores the captions as a plain JSONL file, then answers queries like *"the hero shot of the beach club"* in seconds — by putting the **entire index into a single model call**. No vector database, no embedding service, no daemon. The index is one file; search is one request.
+<p align="center">
+  <a href="https://github.com/treygoff24/lens/actions/workflows/ci.yml"><img src="https://github.com/treygoff24/lens/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://crates.io/crates/lens-cli"><img src="https://img.shields.io/crates/v/lens-cli.svg" alt="crates.io"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0"></a>
+</p>
 
-Measured on a real 1,100-image library: indexed in 93 seconds for $2.29, zero failures; searches answered in 2–6 seconds for ~$0.20 each.
+You have a folder with a few thousand photos and you need "the hero shot of the beach club." Your options today are scrolling thumbnails or standing up a vector database. `lens` is the third option: caption every image once with a fast vision model (Cerebras `gemma-4-31b`), store the captions in one plain JSONL file, then answer any query by putting the **entire index into a single model call**. No embedding service, no daemon, no server. The index is a file; search is a request.
+
+That sounds like it shouldn't scale, so here are measured numbers from a real 1,100-image library: indexed in 93 seconds for $2.29 with zero failures, and queries answered in 2–6 seconds for about $0.20 each.
 
 `lens` is agent-first: stdout carries exactly one JSON success envelope, stderr exactly one JSON error envelope, exit codes are a stable dictionary, and every error includes a paste-ready `suggestedFix`. There are no prompts, colors, spinners, or implicit modes. Humans are welcome too — `find --gallery` writes an HTML contact sheet for eyeballs.
 
 ## Install
 
-Requires Rust 1.85+ (edition 2024). Not yet on crates.io (the `lens` name is taken):
-
 ```sh
-cargo install --git https://github.com/treygoff24/lens
-# or from a clone:
-cargo install --path .
+# Homebrew (macOS/Linux)
+brew install treygoff24/tap/lens
+
+# Shell installer — prebuilt binary, no toolchain needed
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/treygoff24/lens/releases/latest/download/lens-cli-installer.sh | sh
+
+# Cargo — builds from source, needs Rust 1.85+
+cargo install lens-cli
 ```
+
+All three install a binary named `lens`. (The crates.io package is `lens-cli` because the bare `lens` name was taken.)
+
+## 🤖 If you're an agent reading this
+
+You can set this up for your human right now. **[AGENTS.md](AGENTS.md)** is the complete machine-facing contract: install paths, key setup, the envelope schemas, the exit-code dictionary, cost-safety rails (`--dry-run`, `--max-dollars`), and the failure modes that would otherwise cost you a debugging loop. The binary also describes itself: `lens capabilities --json` and `lens schema all --json`.
 
 ## Quickstart
 

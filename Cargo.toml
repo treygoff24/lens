@@ -1,14 +1,23 @@
 [package]
-name = "lens"
-version = "0.1.0"
+name = "lens-cli"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Agent-first CLI for natural-language image-library search: caption once with Cerebras vision, then search the whole index in one model call."
 license = "Apache-2.0"
 repository = "https://github.com/treygoff24/lens"
+homepage = "https://github.com/treygoff24/lens"
 readme = "README.md"
 keywords = ["cli", "image-search", "ai-agents", "vision", "cerebras"]
 categories = ["command-line-utilities", "multimedia::images"]
+
+[lib]
+name = "lens"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lens"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
@@ -25,3 +34,8 @@ sha2 = "0.11.0"
 assert_cmd = "2.1.1"
 predicates = "3.1.3"
 tempfile = "3.27.0"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
