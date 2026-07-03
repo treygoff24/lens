@@ -20,6 +20,10 @@ use crate::store::IndexRecord;
 
 pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensError> {
     let started = Instant::now();
+    if args.query.trim().is_empty() {
+        return Err(LensError::no_input("find requires a non-empty <QUERY>")
+            .with_suggested_fix("run `lens find \"beach club hero shot\" --dir ./photos`"));
+    }
     let library_path = resolve_library_path(&args.dir)?;
     let cfg = Config::load()?;
     let model = model_from(&global.model, &cfg);

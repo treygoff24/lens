@@ -373,6 +373,30 @@ fn missing_key_exits_auth_with_suggested_fix() {
 }
 
 #[test]
+fn whitespace_query_exits_11_no_input() {
+    let home = temp_root("home-blank-query");
+    let xdg = temp_root("xdg-blank-query");
+    let output = lens_cmd(&home, &xdg)
+        .arg("--json")
+        .arg("find")
+        .arg("   ")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(11));
+    assert!(output.stdout.is_empty());
+    let stderr = json_stderr(&output);
+    assert_eq!(stderr["schema"], "lens.cli.error.v1");
+    assert_eq!(stderr["error"]["code"], "no_input");
+    assert!(
+        stderr["error"]["suggestedFix"]
+            .as_str()
+            .unwrap()
+            .contains("lens find")
+    );
+}
+
+#[test]
 fn missing_query_arg_is_usage() {
     let home = temp_root("home-missing-query");
     let xdg = temp_root("xdg-missing-query");
