@@ -191,13 +191,13 @@ Integration tests run the real binary against a local mock Cerebras server — n
 CEREBRAS_API_KEY=... cargo run --release --example debug_caption -- path/to/image.jpg
 ```
 
-The design doc — including the adversarial design review and its accepted/rejected findings — is at [`docs/plans/2026-07-01-lens-cli-design.md`](docs/plans/2026-07-01-lens-cli-design.md).
+The design doc — including the adversarial design review and its accepted/rejected findings — is at [`docs/plans/2026-07-01-lens-cli-design.md`](docs/plans/2026-07-01-lens-cli-design.md). Release history is in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## Provenance
 
 lens was designed, built, reviewed, and shipped almost entirely by [Claude](https://claude.com/claude-code) (Anthropic's Fable 5 and friends, with Codex and Cursor lanes as adversarial reviewers), coordinated through a multi-model build loop. The human in the loop is [Trey Goff](https://github.com/treygoff24), who mostly said "yes," "ship it," and paid for the tokens. Every cost and performance number in this README was measured on real runs, not asserted.
 
-Sibling project: same envelope contract and exit-code dictionary as `recon` (agent-first web recon CLI).
+Sibling project: same envelope contract and exit-code dictionary as [`receipts`](https://github.com/treygoff24/receipts) (agent-first web research CLI).
 
 ## License
 
