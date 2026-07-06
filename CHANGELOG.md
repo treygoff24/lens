@@ -3,13 +3,13 @@
 All notable changes to `lens` are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [Unreleased]
+## [0.1.2] — 2026-07-06
 
 ### Fixed
 
 - Wired exit code 11 (`no_input`): a blank `find` query now returns a structured
   error instead of a success envelope with zero hits. Found by an automated QA
-  sweep; not yet published to crates.io or GitHub Releases as a new version.
+  sweep.
 
 ## [0.1.1] — 2026-07-03
 

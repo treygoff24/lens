@@ -1,6 +1,6 @@
 [package]
 name = "lens-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 description = "Agent-first CLI for natural-language image-library search: caption once with Cerebras vision, then search the whole index in one model call."
