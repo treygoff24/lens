@@ -1,22 +1,11 @@
 //! Diagnosis helper: run normalize+caption on one file, print raw model output.
 //! Usage: CEREBRAS_API_KEY=... cargo run --release --example debug_caption -- <image>
 
-use lens::indexer::CaptionChat;
+use lens::indexer::{CaptionChat, CaptionPayload};
 use lens::normalize::{NormalizeOutput, normalize_image};
 use lens::providers::cerebras::{CerebrasClient, json_repair};
 use lens::providers::new_spend;
-use serde::Deserialize;
 use std::path::Path;
-
-#[allow(dead_code)]
-#[derive(Deserialize)]
-struct CaptionPayload {
-    description: String,
-    filename: String,
-    tags: Vec<String>,
-    text_content: String,
-    kind: String,
-}
 
 fn main() {
     let path = std::env::args()

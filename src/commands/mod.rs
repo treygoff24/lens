@@ -1,30 +1,21 @@
 pub mod capabilities;
+mod common;
 pub mod doctor;
 pub mod find;
 pub mod index;
 pub mod schema;
 pub mod status;
 
-use std::path::{Path, PathBuf};
-
 use clap::Parser;
 use clap::error::ErrorKind;
 use serde::Serialize;
 
 use crate::cli::{Cli, Commands, edit_distance};
-use crate::config::Config;
-use crate::envelope::{
-    Budget, CostDollars, Diagnostics, ErrorEnvelope, SuccessEnvelope, emit_error, emit_success,
-};
-use crate::error::{LensError, Provider};
-use crate::providers::{SharedSpend, new_spend};
-use crate::store::Store;
+use crate::envelope::{ErrorEnvelope, emit_error, emit_success};
+use crate::error::LensError;
 
-pub struct CommandSuccess {
-    pub envelope: SuccessEnvelope,
-    pub exit_code: i32,
-    pub hint: Option<&'static str>,
-}
+pub use common::CommandSuccess;
+use common::zero_envelope;
 
 #[derive(Serialize)]
 struct TextData {
@@ -214,79 +205,6 @@ fn best_match<'a>(needle: &str, choices: &'a [&'a str]) -> Option<&'a str> {
         .filter(|(_, distance)| *distance <= 3)
         .min_by_key(|(_, distance)| *distance)
         .map(|(choice, _)| choice)
-}
-
-pub(crate) fn zero_envelope(command: &str, data: impl Serialize) -> SuccessEnvelope {
-    SuccessEnvelope::new(
-        command,
-        serde_json::to_value(data).expect("command data serializes"),
-        CostDollars {
-            model: 0.0,
-            search: 0.0,
-            total: 0.0,
-            estimated: false,
-        },
-        Budget { hit: None },
-        Diagnostics {
-            duration_ms: 0,
-            retries: 0,
-        },
-        None,
-    )
-}
-
-pub(crate) fn cost_from_spend(spend: &SharedSpend, estimated: bool) -> CostDollars {
-    let spend = spend.lock().unwrap();
-    CostDollars {
-        model: spend.dollars,
-        search: 0.0,
-        total: spend.total_dollars(),
-        estimated,
-    }
-}
-
-pub(crate) fn retries_from_spend(spend: &SharedSpend) -> u32 {
-    spend.lock().unwrap().retries.min(u32::MAX as u64) as u32
-}
-
-pub(crate) fn require_key(key: Option<&str>) -> Result<String, LensError> {
-    key.filter(|value| !value.trim().is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| {
-            LensError::auth("missing Cerebras API key; set CEREBRAS_API_KEY")
-                .with_provider(Provider::Cerebras)
-                .with_suggested_fix(
-                    "set CEREBRAS_API_KEY or add cerebras_api_key to ~/.config/lens/config.toml; verify with: lens doctor",
-                )
-        })
-}
-
-pub(crate) fn model_from(global_model: &Option<String>, cfg: &Config) -> String {
-    global_model.clone().unwrap_or_else(|| cfg.model.clone())
-}
-
-pub(crate) fn open_store(
-    library_path: &Path,
-    index_path: Option<&PathBuf>,
-) -> Result<Store, LensError> {
-    match index_path {
-        Some(path) => Store::open_at(path),
-        None => Store::open_for_library(library_path),
-    }
-}
-
-pub(crate) fn resolve_library_path(path: &Path) -> Result<PathBuf, LensError> {
-    std::fs::canonicalize(path).map_err(|err| {
-        LensError::config(format!(
-            "failed to resolve library path {}: {err}",
-            path.display()
-        ))
-        .with_suggested_fix("pass an existing directory to lens index/find/status")
-    })
-}
-
-pub(crate) fn new_shared_spend() -> SharedSpend {
-    new_spend()
 }
 
 #[cfg(test)]

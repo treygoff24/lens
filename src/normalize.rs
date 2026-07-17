@@ -241,7 +241,7 @@ fn normalize_with_sips(path: &Path, missing_as_unsupported: bool) -> Option<Norm
     }
 }
 
-fn sips_exists() -> bool {
+pub(crate) fn sips_exists() -> bool {
     Command::new("sips")
         .arg("--help")
         .stdout(std::process::Stdio::null())

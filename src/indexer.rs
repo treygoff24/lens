@@ -16,7 +16,7 @@ use crate::providers::cerebras::{
     CerebrasClient, ChatOpts, ChatResponse, JsonSchema, Message, ResponseFormat, json_repair,
 };
 use crate::store::{IndexRecord, Store};
-use crate::walk::{WalkedFile, partition_freshness, walk_library};
+use crate::walk::{WalkedFile, partition_with_stale_all, walk_library};
 
 pub const CAPTION_WORST_CASE_COST: f64 = 0.008;
 pub const DEFAULT_INDEX_CONCURRENCY: usize = 25;
@@ -125,7 +125,6 @@ impl CaptionChat for CerebrasClient {
                 // cap truncates the JSON. Measured live 2026-07-01: temp 0.4
                 // cleared 3/3 attempts on an image that failed 3/3 at default.
                 temperature: terse.then_some(0.4),
-                ..ChatOpts::default()
             },
         )
     }
@@ -145,7 +144,6 @@ pub fn index_library(
     let start = Instant::now();
     let (_lock, lock_warning) = store.lock()?;
 
-    // Keep warnings structured until the command chooses JSON or human output.
     let mut warnings = Vec::new();
     if let Some(w) = lock_warning {
         warnings.push(w);
@@ -160,10 +158,7 @@ pub fn index_library(
 
     // Partition first so a stale model still distinguishes recaption candidates
     // from files that truly vanished and must be pruned.
-    let mut freshness = partition_freshness(&walked, &loaded.records);
-    if loaded.stale_all {
-        freshness.mark_all_stale();
-    }
+    let freshness = partition_with_stale_all(&walked, &loaded.records, loaded.stale_all);
 
     let mut work = freshness
         .stale
@@ -354,7 +349,8 @@ fn caption_one(file: WalkedFile, chat: &dyn CaptionChat) -> WorkerOutput {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct CaptionPayload {
+#[doc(hidden)]
+pub struct CaptionPayload {
     description: String,
     filename: String,
     tags: Vec<String>,
@@ -579,7 +575,6 @@ mod tests {
                 .expect("scripted caption response");
             next.map(|content| ChatResponse {
                 content,
-                tool_calls: Vec::new(),
                 usage: Default::default(),
                 wall_time_ms: 1,
             })
@@ -765,7 +760,7 @@ mod tests {
         store.append(&record_for(file, "original caption")).unwrap();
         store.ensure_meta(dir.path(), "m").unwrap();
 
-        // Ensure the mtime differs from the original walk.
+        // An immediate rewrite may preserve mtime and hide the stale file.
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&good_path, b"\x13\x99\x00not an image\xff\x00").unwrap();
 
@@ -799,7 +794,7 @@ mod tests {
         store.append(&record_for(file, "old caption")).unwrap();
         store.ensure_meta(dir.path(), "m").unwrap();
 
-        // Ensure the mtime differs from the original walk.
+        // An immediate rewrite may preserve mtime and hide the stale file.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let img2 = ImageBuffer::from_pixel(2, 2, Rgba([20u8, 0, 0, 255]));
         img2.save(&good_path).unwrap();

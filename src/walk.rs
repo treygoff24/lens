@@ -41,6 +41,18 @@ pub fn walk_library(root: impl AsRef<Path>) -> Result<Vec<WalkedFile>, LensError
     Ok(out)
 }
 
+pub(crate) fn partition_with_stale_all(
+    walked: &[WalkedFile],
+    records: &[IndexRecord],
+    stale_all: bool,
+) -> Freshness {
+    let mut freshness = partition_freshness(walked, records);
+    if stale_all {
+        freshness.mark_all_stale();
+    }
+    freshness
+}
+
 pub fn partition_freshness(walked: &[WalkedFile], records: &[IndexRecord]) -> Freshness {
     let mut last_by_path: HashMap<&str, &IndexRecord> = HashMap::new();
     for record in records {

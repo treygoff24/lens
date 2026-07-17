@@ -26,9 +26,6 @@ type FindRouter = Vec<(String, Vec<i64>)>;
 struct MockState {
     captions: Mutex<VecDeque<String>>,
     find_ids: Mutex<VecDeque<Vec<i64>>>,
-    /// Optional content-based router for find responses. When set, each "hits"
-    /// request is matched against the router entries: the first entry whose
-    /// marker string appears in the request body determines the response.
     find_router: Mutex<FindRouter>,
     /// Optional canned raw content for find responses (for bad-JSON tests).
     find_raw: Mutex<VecDeque<String>>,
@@ -102,8 +99,6 @@ impl MockServer {
         self.requests.load(Ordering::SeqCst)
     }
 
-    /// Returns the raw body of the most recent request received by the mock,
-    /// or `None` if no request has been received yet.
     pub(super) fn last_request_body(&self) -> Option<String> {
         self.last_request_body.lock().unwrap().clone()
     }

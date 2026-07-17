@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 
 use crate::cli::{GlobalArgs, SchemaArgs, SchemaTarget};
-use crate::commands::{CommandSuccess, zero_envelope};
+use crate::commands::common::{CommandSuccess, zero_envelope};
 use crate::error::LensError;
 
 pub fn run(_global: &GlobalArgs, args: &SchemaArgs) -> Result<CommandSuccess, LensError> {

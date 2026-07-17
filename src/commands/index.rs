@@ -2,22 +2,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
-use serde_json::to_value;
 
 use crate::budget::Budget as RunBudget;
 use crate::cli::{GlobalArgs, IndexArgs};
-use crate::commands::{
-    CommandSuccess, cost_from_spend, model_from, new_shared_spend, open_store, require_key,
-    resolve_library_path, retries_from_spend,
+use crate::commands::common::{
+    CommandSuccess, IndexStateData, estimated_envelope, metered_envelope, model_from,
+    new_shared_spend, open_store, require_key, resolve_library_path, response_value,
 };
 use crate::config::Config;
-use crate::envelope::{Budget, Diagnostics, SuccessEnvelope};
 use crate::error::LensError;
 use crate::indexer::{
     CAPTION_WORST_CASE_COST, IndexOptions, IndexOutcome, IndexReport, index_library,
 };
 use crate::providers::cerebras::CerebrasClient;
-use crate::walk::{partition_freshness, walk_library};
+use crate::walk::{partition_with_stale_all, walk_library};
 
 #[derive(Serialize)]
 struct IndexData<'a> {
@@ -29,19 +27,12 @@ struct IndexData<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct IndexDryRunData {
-    library_path: String,
-    index_path: String,
+    #[serde(flatten)]
+    state: IndexStateData,
     outcome: &'static str,
     dry_run: bool,
     planned_work: usize,
-    indexed: usize,
-    fresh: usize,
-    stale: usize,
-    new: usize,
-    vanished: usize,
-    stale_all: bool,
     projected_worst_case_cost: f64,
-    projected_wall_seconds: f64,
 }
 
 pub fn run(global: &GlobalArgs, args: &IndexArgs) -> Result<CommandSuccess, LensError> {
@@ -74,29 +65,19 @@ pub fn run(global: &GlobalArgs, args: &IndexArgs) -> Result<CommandSuccess, Lens
         IndexOutcome::Complete(_) => "complete",
         IndexOutcome::Partial(_) => "partial",
     };
-    let data = to_value(IndexData {
-        report,
-        outcome: outcome_name,
-    })
-    .map_err(|err| LensError::upstream(format!("failed to serialize index report: {err}")))?;
+    let data = response_value(
+        "index report",
+        IndexData {
+            report,
+            outcome: outcome_name,
+        },
+    )?;
     let exit_code = if matches!(outcome, IndexOutcome::Partial(_)) {
         10
     } else {
         0
     };
-    let envelope = SuccessEnvelope::new(
-        "index",
-        data,
-        cost_from_spend(&spend, false),
-        Budget {
-            hit: budget.hit().map(str::to_string),
-        },
-        Diagnostics {
-            duration_ms: started.elapsed().as_millis() as u64,
-            retries: retries_from_spend(&spend),
-        },
-        None,
-    );
+    let envelope = metered_envelope("index", data, &spend, budget.hit(), &started);
     Ok(CommandSuccess {
         envelope,
         exit_code,
@@ -112,44 +93,31 @@ fn dry_run(
 ) -> Result<CommandSuccess, LensError> {
     let walked = walk_library(library_path)?;
     let loaded = store.load(model)?;
-    let mut freshness = partition_freshness(&walked, &loaded.records);
-    if loaded.stale_all {
-        freshness.mark_all_stale();
-    }
+    let freshness = partition_with_stale_all(&walked, &loaded.records, loaded.stale_all);
     let indexable = freshness.stale.len() + freshness.new.len();
     let projected = indexable as f64 * CAPTION_WORST_CASE_COST;
-    let data = to_value(IndexDryRunData {
-        library_path: library_path.to_string_lossy().into_owned(),
-        index_path: store.dir().to_string_lossy().into_owned(),
-        outcome: "planned",
-        dry_run: true,
-        planned_work: indexable,
-        indexed: loaded.records.len(),
-        fresh: freshness.fresh.len(),
-        stale: freshness.stale.len(),
-        new: freshness.new.len(),
-        vanished: freshness.vanished.len(),
-        stale_all: loaded.stale_all,
-        projected_worst_case_cost: projected,
-        projected_wall_seconds: indexable as f64 / f64::from(global.concurrency) * 1.5,
-    })
-    .map_err(|err| LensError::upstream(format!("failed to serialize index plan: {err}")))?;
-    let envelope = SuccessEnvelope::new(
+    let envelope = estimated_envelope(
         "index",
-        data,
-        crate::envelope::CostDollars {
-            model: projected,
-            search: 0.0,
-            total: projected,
-            estimated: true,
+        "index plan",
+        IndexDryRunData {
+            state: IndexStateData {
+                library_path: library_path.to_string_lossy().into_owned(),
+                index_path: store.dir().to_string_lossy().into_owned(),
+                indexed: loaded.records.len(),
+                fresh: freshness.fresh.len(),
+                stale: freshness.stale.len(),
+                new: freshness.new.len(),
+                vanished: freshness.vanished.len(),
+                stale_all: loaded.stale_all,
+                projected_wall_seconds: indexable as f64 / f64::from(global.concurrency) * 1.5,
+            },
+            outcome: "planned",
+            dry_run: true,
+            planned_work: indexable,
+            projected_worst_case_cost: projected,
         },
-        Budget { hit: None },
-        Diagnostics {
-            duration_ms: 0,
-            retries: 0,
-        },
-        None,
-    );
+        projected,
+    )?;
     Ok(CommandSuccess {
         envelope,
         exit_code: 0,

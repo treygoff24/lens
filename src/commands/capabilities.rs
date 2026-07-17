@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use crate::cli::GlobalArgs;
-use crate::commands::{CommandSuccess, zero_envelope};
+use crate::commands::common::{CommandSuccess, zero_envelope};
 use crate::config::{DEFAULT_API_BASE, DEFAULT_MAX_CONCURRENCY, DEFAULT_MODEL};
 use crate::error::LensError;
 use crate::indexer::CAPTION_WORST_CASE_COST;

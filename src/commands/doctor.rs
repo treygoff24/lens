@@ -1,17 +1,15 @@
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
 use serde::Serialize;
-use serde_json::to_value;
 
 use crate::cli::{DoctorArgs, GlobalArgs};
-use crate::commands::{
-    CommandSuccess, cost_from_spend, model_from, new_shared_spend, require_key, retries_from_spend,
+use crate::commands::common::{
+    CommandSuccess, metered_envelope, model_from, new_shared_spend, require_key, response_value,
 };
 use crate::config::Config;
-use crate::envelope::{Budget, Diagnostics, SuccessEnvelope};
 use crate::error::LensError;
+use crate::normalize::sips_exists;
 use crate::providers::cerebras::{CerebrasClient, ChatOpts, Message};
 
 #[derive(Debug, Serialize)]
@@ -81,19 +79,8 @@ pub fn run(global: &GlobalArgs, args: &DoctorArgs) -> Result<CommandSuccess, Len
         0
     };
     let report = report(checks);
-    let envelope = SuccessEnvelope::new(
-        "doctor",
-        to_value(report).map_err(|err| {
-            LensError::upstream(format!("failed to serialize doctor report: {err}"))
-        })?,
-        cost_from_spend(&spend, false),
-        Budget { hit: None },
-        Diagnostics {
-            duration_ms: started.elapsed().as_millis() as u64,
-            retries: retries_from_spend(&spend),
-        },
-        None,
-    );
+    let data = response_value("doctor report", report)?;
+    let envelope = metered_envelope("doctor", data, &spend, None, &started);
     Ok(CommandSuccess {
         envelope,
         exit_code,
@@ -148,13 +135,7 @@ fn key_presence_check(key: Option<&str>) -> DoctorCheck {
 }
 
 fn sips_check() -> DoctorCheck {
-    let ok = Command::new("sips")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok();
-    if ok {
+    if sips_exists() {
         ok_check(
             "deps.sips",
             "deps",

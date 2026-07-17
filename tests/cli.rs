@@ -444,7 +444,7 @@ fn capabilities_and_schema_emit_contract_envelopes() {
         stdout["data"]["exitCodes"]["10"],
         "partial/refused; stdout carries ok:true success envelope with budget.hit set"
     );
-    // This contract value is evidence from the measured acceptance run.
+    // Keep the published cost expectation tied to the measured acceptance run.
     assert!(
         stdout["data"]["costExpectations"]["prototypeRun"]
             .as_str()
@@ -669,12 +669,12 @@ fn chunked_find_e2e_resolves_correct_records() {
     let server2 = MockServer::with(
         vec![],
         vec![
-            vec![2],    // chunk 0
-            vec![1],    // chunk 1
-            vec![3],    // chunk 2
-            vec![0],    // chunk 3 (if any)
-            vec![5],    // chunk 4 (if any)
-            vec![4],    // chunk 5 (if any)
+            vec![2],
+            vec![1],
+            vec![3],
+            vec![0],
+            vec![5],
+            vec![4],
             vec![2, 0], // rerank (non-zero ids)
         ],
     );

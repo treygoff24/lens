@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use crate::error::{LensError, Provider};
 use crate::providers::{
@@ -11,139 +10,75 @@ use crate::providers::{
     run_with_retries,
 };
 
-/// A chat-completions message.
-///
-/// Serializes to the three shapes Cerebras (OpenAI-compat) accepts:
-/// - user/system/assistant text or vision parts: `{"role","content"}`
-/// - assistant tool_calls (NO `content` key, which Cerebras rejects alongside tool_calls)
-/// - tool results: `{"role":"tool","tool_call_id","content"}`
-///
-/// Fields that don't apply to a given role are omitted from serialization so the
-/// wire payload stays well-formed.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Message {
     pub role: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<MessageContent>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<MessageToolCall>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
+    pub content: MessageContent,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MessageToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub kind: ToolType,
-    pub function: MessageToolFunction,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MessageToolFunction {
-    pub name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolType {
-    Function,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentPart {
     Text { text: String },
     ImageUrl { image_url: ImageUrl },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ImageUrl {
     pub url: String,
 }
 
 impl Message {
-    pub fn system(text: impl Into<String>) -> Self {
-        Self {
-            role: "system".into(),
-            content: Some(MessageContent::Text(text.into())),
-            tool_calls: None,
-            tool_call_id: None,
-        }
-    }
-
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: "user".into(),
-            content: Some(MessageContent::Text(text.into())),
-            tool_calls: None,
-            tool_call_id: None,
+            content: MessageContent::Text(text.into()),
         }
     }
 
     pub fn user_with_image(text: &str, data_uri: String) -> Self {
         Self {
             role: "user".into(),
-            content: Some(MessageContent::Parts(vec![
+            content: MessageContent::Parts(vec![
                 ContentPart::Text {
                     text: text.to_string(),
                 },
                 ContentPart::ImageUrl {
                     image_url: ImageUrl { url: data_uri },
                 },
-            ])),
-            tool_calls: None,
-            tool_call_id: None,
-        }
-    }
-
-    /// Assistant message carrying tool calls and no `content` (Cerebras rejects
-    /// `content` alongside `tool_calls`).
-    pub fn assistant_tool_calls(tool_calls: Vec<MessageToolCall>) -> Self {
-        Self {
-            role: "assistant".into(),
-            content: None,
-            tool_calls: Some(tool_calls),
-            tool_call_id: None,
-        }
-    }
-
-    pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            role: "tool".into(),
-            content: Some(MessageContent::Text(content.into())),
-            tool_calls: None,
-            tool_call_id: Some(tool_call_id.into()),
+            ]),
         }
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct ChatOpts {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u64>,
-    pub tools: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ResponseFormat {
-    JsonObject,
-    JsonSchema { json_schema: StructuredOutput },
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    response_type: &'static str,
+    json_schema: StructuredOutput,
 }
 
 impl ResponseFormat {
     pub fn json_schema(name: impl Into<String>, schema: JsonSchema) -> Self {
-        Self::JsonSchema {
+        Self {
+            response_type: "json_schema",
             json_schema: StructuredOutput {
                 name: name.into(),
                 strict: true,
@@ -245,14 +180,7 @@ enum JsonSchemaType {
     Integer,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ToolCall {
-    pub id: String,
-    pub function_name: String,
-    pub arguments: String,
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -261,7 +189,6 @@ pub struct TokenUsage {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatResponse {
     pub content: String,
-    pub tool_calls: Vec<ToolCall>,
     pub usage: TokenUsage,
     pub wall_time_ms: u64,
 }
@@ -280,14 +207,8 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [Message],
     stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_completion_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    response_format: Option<ResponseFormat>,
+    #[serde(flatten)]
+    opts: ChatOpts,
 }
 
 impl CerebrasClient {
@@ -343,10 +264,7 @@ impl CerebrasClient {
             model: &self.model,
             messages,
             stream: false,
-            temperature: opts.temperature,
-            max_completion_tokens: opts.max_completion_tokens,
-            tools: opts.tools,
-            response_format: opts.response_format,
+            opts,
         }
     }
 
@@ -453,51 +371,22 @@ fn parse_chat_response(raw: &str) -> Result<ChatResponse, LensError> {
                 .with_provider(Provider::Cerebras)
         })?
         .message;
-    let content = match &message.content {
-        Some(content) => content.clone(),
-        None if message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty()) =>
-        {
-            String::new()
-        }
-        None => {
-            return Err(LensError::upstream(
-                "Cerebras response contained neither content nor tool calls",
-            )
-            .with_provider(Provider::Cerebras));
-        }
-    };
+    let content = message.content.clone().ok_or_else(|| {
+        LensError::upstream("Cerebras response contained no content")
+            .with_provider(Provider::Cerebras)
+    })?;
 
     Ok(ChatResponse {
         content,
-        tool_calls: tool_calls(message),
-        usage: TokenUsage {
-            prompt_tokens: response.usage.prompt_tokens,
-            completion_tokens: response.usage.completion_tokens,
-        },
+        usage: response.usage,
         wall_time_ms: 0,
     })
-}
-
-fn tool_calls(message: &RawMessage) -> Vec<ToolCall> {
-    message
-        .tool_calls
-        .iter()
-        .flatten()
-        .map(|call| ToolCall {
-            id: call.id.clone(),
-            function_name: call.function.name.clone(),
-            arguments: call.function.arguments.clone(),
-        })
-        .collect()
 }
 
 #[derive(Debug, Deserialize)]
 struct RawChatResponse {
     choices: Vec<RawChoice>,
-    usage: RawUsage,
+    usage: TokenUsage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -508,32 +397,13 @@ struct RawChoice {
 #[derive(Debug, Deserialize)]
 struct RawMessage {
     content: Option<String>,
-    tool_calls: Option<Vec<RawToolCall>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawToolCall {
-    id: String,
-    function: RawFunction,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawFunction {
-    name: String,
-    arguments: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::providers::Spend;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::sync::Mutex;
 
     #[test]
@@ -553,16 +423,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_content_tool_calls_and_usage_verbatim() {
+    fn parses_content_and_usage_verbatim() {
         // Repairing the already-valid HTTP envelope would corrupt escaped content.
         let raw = r#"{
             "choices": [{
                 "message": {
-                    "content": "Próspera nope",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "function": {"name": "search", "arguments": "{\"q\":\"x\"}"}
-                    }]
+                    "content": "Próspera nope"
                 }
             }],
             "usage": {"prompt_tokens": 1000, "completion_tokens": 2000}
@@ -571,8 +437,6 @@ mod tests {
         let parsed = parse_chat_response(raw).unwrap();
 
         assert_eq!(parsed.content, "Próspera nope");
-        assert_eq!(parsed.tool_calls[0].id, "call_1");
-        assert_eq!(parsed.tool_calls[0].function_name, "search");
         assert_eq!(parsed.usage.prompt_tokens, 1000);
         assert_eq!(parsed.usage.completion_tokens, 2000);
     }
@@ -589,22 +453,6 @@ mod tests {
     }
 
     #[test]
-    fn accepts_tool_call_response_without_content() {
-        let raw = r#"{
-            "choices": [{"message": {"tool_calls": [{
-                "id": "call_1",
-                "function": {"name": "search", "arguments": "{}"}
-            }]}}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
-        }"#;
-
-        let parsed = parse_chat_response(raw).unwrap();
-
-        assert!(parsed.content.is_empty());
-        assert_eq!(parsed.tool_calls[0].id, "call_1");
-    }
-
-    #[test]
     fn json_repair_on_model_content_yields_parseable_json() {
         // Repair is limited to untrusted model content; HTTP envelopes are valid JSON.
         let repaired = json_repair("{\"claim\":\"Café\u{0001} \\u broken \\u00E9\"}");
@@ -614,14 +462,12 @@ mod tests {
     }
 
     #[test]
-    fn message_serializes_each_role_shape_correctly() {
+    fn message_serializes_text_and_image_shapes() {
         let user = serde_json::to_value(Message::user("hi")).unwrap();
         let user_obj = user.as_object().unwrap();
         assert_eq!(user_obj.len(), 2);
         assert_eq!(user["role"], "user");
         assert_eq!(user["content"], "hi");
-        assert!(user.get("tool_calls").is_none());
-        assert!(user.get("tool_call_id").is_none());
 
         let image = serde_json::to_value(Message::user_with_image(
             "describe this",
@@ -641,28 +487,6 @@ mod tests {
                 ]
             })
         );
-
-        let assistant =
-            serde_json::to_value(Message::assistant_tool_calls(vec![MessageToolCall {
-                id: "call_1".into(),
-                kind: ToolType::Function,
-                function: MessageToolFunction {
-                    name: "search".into(),
-                    arguments: "{}".into(),
-                },
-            }]))
-            .unwrap();
-        let assistant_obj = assistant.as_object().unwrap();
-        assert_eq!(assistant_obj.len(), 2);
-        assert_eq!(assistant["role"], "assistant");
-        assert!(assistant.get("content").is_none(), "content must be absent");
-        assert!(assistant["tool_calls"].is_array());
-
-        let tool = serde_json::to_value(Message::tool("call_1", "result body")).unwrap();
-        assert_eq!(tool["role"], "tool");
-        assert_eq!(tool["tool_call_id"], "call_1");
-        assert_eq!(tool["content"], "result body");
-        assert!(tool.get("tool_calls").is_none());
     }
 
     #[test]

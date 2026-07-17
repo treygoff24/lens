@@ -12,13 +12,10 @@ pub const USER_AGENT: &str = concat!(
 );
 const MAX_ATTEMPTS: usize = 6;
 
-/// Global per-request timeout for upstream HTTP calls.
-///
 /// ureq 3.x defaults to no global timeout, which would let a hung upstream
 /// block a worker past `--max-seconds`. 120s matches the measured prototype.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Builds a `ureq::Agent` with the shared global timeout configured.
 pub(crate) fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))

@@ -41,7 +41,6 @@ pub struct FindData {
     pub warnings: Vec<String>,
     #[serde(rename = "kindFilter", skip_serializing_if = "Vec::is_empty")]
     pub kind_filter: Vec<String>,
-    /// Number of out-of-range model ids discarded.
     #[serde(skip_serializing_if = "is_zero")]
     pub invalid_ids_dropped: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -232,7 +231,6 @@ pub fn plan(query: &str, records: &[IndexRecord], top: usize) -> FindPlan {
     }
 }
 
-/// Runs per-chunk searches, unions their results, then reranks that union.
 fn chunked_ids(
     query: &str,
     snapshot: &[SnapshotRecord],
@@ -348,9 +346,7 @@ fn find_call(
 }
 
 fn resolve_ids(ids: &[usize], snapshot: &[SnapshotRecord]) -> Vec<IndexRecord> {
-    ids.iter()
-        .filter_map(|&id| snapshot.get(id).map(|item| item.record.clone()))
-        .collect()
+    ids.iter().map(|&id| snapshot[id].record.clone()).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -492,7 +488,7 @@ fn chunk_top(top: usize) -> usize {
 }
 
 fn chunks_for(query: &str, snapshot: &[SnapshotRecord], top: usize) -> Vec<Vec<SnapshotRecord>> {
-    // Size chunks with the larger per-chunk result count used by workers.
+    // Using the worker result limit here prevents underestimating prompt size.
     let ct = chunk_top(top);
     let mut chunks: Vec<Vec<SnapshotRecord>> = Vec::new();
     let mut current = Vec::new();
@@ -574,7 +570,6 @@ mod tests {
                 .expect("scripted find response");
             Ok(ChatResponse {
                 content,
-                tool_calls: Vec::new(),
                 usage: Default::default(),
                 wall_time_ms: 1,
             })
