@@ -6,23 +6,14 @@ use serde::Serialize;
 use crate::budget::Budget as RunBudget;
 use crate::cli::{GlobalArgs, IndexArgs};
 use crate::commands::common::{
-    CommandSuccess, IndexStateData, estimated_envelope, metered_envelope, model_from,
-    new_shared_spend, open_store, require_key, resolve_library_path, response_value,
+    CommandSuccess, IndexStateData, OutcomeData, estimated_envelope, load_index_state,
+    metered_envelope, model_from, new_shared_spend, open_store, require_key, resolve_library_path,
+    response_value,
 };
 use crate::config::Config;
 use crate::error::LensError;
-use crate::indexer::{
-    CAPTION_WORST_CASE_COST, IndexOptions, IndexOutcome, IndexReport, index_library,
-};
+use crate::indexer::{IndexOptions, IndexOutcome, index_library};
 use crate::providers::cerebras::CerebrasClient;
-use crate::walk::{partition_with_stale_all, walk_library};
-
-#[derive(Serialize)]
-struct IndexData<'a> {
-    #[serde(flatten)]
-    report: &'a IndexReport,
-    outcome: &'static str,
-}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -67,9 +58,9 @@ pub fn run(global: &GlobalArgs, args: &IndexArgs) -> Result<CommandSuccess, Lens
     };
     let data = response_value(
         "index report",
-        IndexData {
-            report,
-            outcome: outcome_name,
+        OutcomeData {
+            data: report,
+            outcome: Some(outcome_name),
         },
     )?;
     let exit_code = if matches!(outcome, IndexOutcome::Partial(_)) {
@@ -91,32 +82,18 @@ fn dry_run(
     store: &crate::store::Store,
     model: &str,
 ) -> Result<CommandSuccess, LensError> {
-    let walked = walk_library(library_path)?;
-    let loaded = store.load(model)?;
-    let freshness = partition_with_stale_all(&walked, &loaded.records, loaded.stale_all);
-    let indexable = freshness.stale.len() + freshness.new.len();
-    let projected = indexable as f64 * CAPTION_WORST_CASE_COST;
+    let state = load_index_state(library_path, store, model, global.concurrency)?;
     let envelope = estimated_envelope(
         "index",
         "index plan",
         IndexDryRunData {
-            state: IndexStateData {
-                library_path: library_path.to_string_lossy().into_owned(),
-                index_path: store.dir().to_string_lossy().into_owned(),
-                indexed: loaded.records.len(),
-                fresh: freshness.fresh.len(),
-                stale: freshness.stale.len(),
-                new: freshness.new.len(),
-                vanished: freshness.vanished.len(),
-                stale_all: loaded.stale_all,
-                projected_wall_seconds: indexable as f64 / f64::from(global.concurrency) * 1.5,
-            },
+            state: state.data,
             outcome: "planned",
             dry_run: true,
-            planned_work: indexable,
-            projected_worst_case_cost: projected,
+            planned_work: state.planned_work,
+            projected_worst_case_cost: state.projected_cost_dollars,
         },
-        projected,
+        state.projected_cost_dollars,
     )?;
     Ok(CommandSuccess {
         envelope,

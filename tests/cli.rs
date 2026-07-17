@@ -9,6 +9,7 @@ use image::{ImageBuffer, Rgba};
 use serde_json::Value;
 
 use common::MockServer;
+use lens::store::IndexRecord;
 
 fn temp_root(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -58,27 +59,27 @@ fn json_stderr(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stderr).unwrap()
 }
 
-fn write_index_records(index_dir: &Path, records: &[Value]) {
+fn write_index_records(index_dir: &Path, records: &[IndexRecord]) {
     std::fs::create_dir_all(index_dir).unwrap();
     let mut jsonl = String::new();
     for record in records {
-        jsonl.push_str(&record.to_string());
+        jsonl.push_str(&serde_json::to_string(record).unwrap());
         jsonl.push('\n');
     }
     std::fs::write(index_dir.join("index.jsonl"), jsonl).unwrap();
 }
 
-fn index_record(rel_path: &str, kind: &str, description: &str) -> Value {
-    serde_json::json!({
-        "relPath": rel_path,
-        "size": 1u64,
-        "mtimeNs": 1i128,
-        "description": description,
-        "filename": rel_path,
-        "tags": [kind],
-        "textContent": "",
-        "kind": kind,
-    })
+fn index_record(rel_path: &str, kind: &str, description: &str) -> IndexRecord {
+    IndexRecord {
+        rel_path: rel_path.to_string(),
+        size: 1,
+        mtime_ns: 1,
+        description: description.to_string(),
+        filename: rel_path.to_string(),
+        tags: vec![kind.to_string()],
+        text_content: String::new(),
+        kind: kind.to_string(),
+    }
 }
 
 fn run_index(server: &MockServer, home: &Path, xdg: &Path, dir: &Path) -> std::process::Output {
@@ -636,7 +637,6 @@ fn chunked_find_e2e_resolves_correct_records() {
     // Let the CLI create its hashed store path before replacing the rows.
     assert_eq!(run_index(&server, &home, &xdg, &dir).status.code(), Some(0));
 
-    // This fixture creates exactly one hashed library directory.
     let libraries_dir = xdg.join("lens/libraries");
     let store_dir: PathBuf = std::fs::read_dir(&libraries_dir)
         .unwrap()
@@ -649,17 +649,17 @@ fn chunked_find_e2e_resolves_correct_records() {
     let long_desc = "large description ".repeat(300);
     let mut records_json = String::new();
     for i in 0..300 {
-        let record = serde_json::json!({
-            "relPath": format!("chunk_{i:03}.jpg"),
-            "size": 1u64,
-            "mtimeNs": 1i128,
-            "description": long_desc,
-            "filename": format!("chunk-{i:03}"),
-            "tags": ["tag"],
-            "textContent": "",
-            "kind": "photo"
-        });
-        records_json.push_str(&record.to_string());
+        let record = IndexRecord {
+            rel_path: format!("chunk_{i:03}.jpg"),
+            size: 1,
+            mtime_ns: 1,
+            description: long_desc.clone(),
+            filename: format!("chunk-{i:03}"),
+            tags: vec!["tag".into()],
+            text_content: String::new(),
+            kind: "photo".into(),
+        };
+        records_json.push_str(&serde_json::to_string(&record).unwrap());
         records_json.push('\n');
     }
     std::fs::write(&index_path, &records_json).unwrap();
@@ -675,7 +675,7 @@ fn chunked_find_e2e_resolves_correct_records() {
             vec![0],
             vec![5],
             vec![4],
-            vec![2, 0], // rerank (non-zero ids)
+            vec![2, 0], // Nonzero rerank ids catch resolution against the full index.
         ],
     );
 

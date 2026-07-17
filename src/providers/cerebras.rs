@@ -1,13 +1,11 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LensError, Provider};
 use crate::providers::{
-    HttpFailure, SharedSpend, SleepFn, USER_AGENT, default_sleep, http_agent, join_url, new_spend,
-    run_with_retries,
+    HttpFailure, SharedSpend, USER_AGENT, http_agent, join_url, new_spend, run_with_retries,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -199,7 +197,6 @@ pub struct CerebrasClient {
     model: String,
     agent: ureq::Agent,
     spend: SharedSpend,
-    sleep_fn: SleepFn,
 }
 
 #[derive(Serialize)]
@@ -219,25 +216,12 @@ impl CerebrasClient {
             model,
             agent: http_agent(),
             spend: new_spend(),
-            sleep_fn: default_sleep(),
         }
     }
 
     pub fn with_spend(mut self, spend: SharedSpend) -> Self {
         self.spend = spend;
         self
-    }
-
-    pub fn with_sleep_fn(
-        mut self,
-        sleep_fn: impl Fn(std::time::Duration) + Send + Sync + 'static,
-    ) -> Self {
-        self.sleep_fn = Arc::new(sleep_fn);
-        self
-    }
-
-    pub fn spend(&self) -> SharedSpend {
-        Arc::clone(&self.spend)
     }
 
     pub(crate) fn spend_snapshot(&self) -> crate::providers::Spend {
@@ -251,7 +235,7 @@ impl CerebrasClient {
         let (raw, retries) = run_with_retries(
             Provider::Cerebras,
             || self.post_json(&url, &body),
-            self.sleep_fn.as_ref(),
+            &std::thread::sleep,
         )?;
         let mut response = parse_chat_response(&raw)?;
         response.wall_time_ms = start.elapsed().as_millis() as u64;
@@ -403,23 +387,33 @@ struct RawMessage {
 mod tests {
     use super::*;
     use crate::providers::Spend;
-    use serde_json::{Value, json};
-    use std::sync::Mutex;
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Deserialize)]
+    struct NamePayload {
+        name: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ClaimPayload {
+        claim: String,
+    }
 
     #[test]
     fn json_repair_strips_bad_control_chars_but_keeps_accented_text() {
         let repaired = json_repair("{\"name\":\"Prós\u{0001}pera\"}");
-        let parsed: Value = serde_json::from_str(&repaired).unwrap();
+        let parsed: NamePayload = serde_json::from_str(&repaired).unwrap();
 
-        assert_eq!(parsed["name"], "Próspera");
+        assert_eq!(parsed.name, "Próspera");
     }
 
     #[test]
     fn json_repair_escapes_bad_unicode_escape_but_keeps_valid_accent_escape() {
         let repaired = json_repair(r#"{"name":"Próspera \u broken \u00F3"}"#);
-        let parsed: Value = serde_json::from_str(&repaired).unwrap();
+        let parsed: NamePayload = serde_json::from_str(&repaired).unwrap();
 
-        assert_eq!(parsed["name"], "Próspera \\u broken ó");
+        assert_eq!(parsed.name, "Próspera \\u broken ó");
     }
 
     #[test]
@@ -456,9 +450,9 @@ mod tests {
     fn json_repair_on_model_content_yields_parseable_json() {
         // Repair is limited to untrusted model content; HTTP envelopes are valid JSON.
         let repaired = json_repair("{\"claim\":\"Café\u{0001} \\u broken \\u00E9\"}");
-        let parsed: Value = serde_json::from_str(&repaired).unwrap();
+        let parsed: ClaimPayload = serde_json::from_str(&repaired).unwrap();
 
-        assert_eq!(parsed["claim"], "Café \\u broken é");
+        assert_eq!(parsed.claim, "Café \\u broken é");
     }
 
     #[test]

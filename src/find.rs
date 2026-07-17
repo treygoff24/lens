@@ -341,7 +341,7 @@ fn find_call(
             ..ChatOpts::default()
         },
     );
-    reservation.settle(0.0);
+    drop(reservation);
     response
 }
 
@@ -349,7 +349,7 @@ fn resolve_ids(ids: &[usize], snapshot: &[SnapshotRecord]) -> Vec<IndexRecord> {
     ids.iter().map(|&id| snapshot[id].record.clone()).collect()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct IdsPayload {
     ids: Vec<i64>,
 }
@@ -524,9 +524,15 @@ fn ids_response_format() -> ResponseFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn ids_json(ids: &[usize]) -> String {
+        serde_json::to_string(&IdsPayload {
+            ids: ids.iter().map(|&id| i64::try_from(id).unwrap()).collect(),
+        })
+        .unwrap()
+    }
 
     fn rec(path: &str, description: &str) -> IndexRecord {
         IndexRecord {
@@ -620,7 +626,7 @@ mod tests {
         assert_eq!(plan.mode, "chunked");
         assert!(plan.chunks > 1);
 
-        let chat = ScriptedFindChat::new(vec![json!({"ids":[0]}).to_string(); plan.chunks + 1]);
+        let chat = ScriptedFindChat::new(vec![ids_json(&[0]); plan.chunks + 1]);
         let spend = crate::providers::new_spend();
         let data = find_with_options(
             "large",
@@ -672,7 +678,7 @@ mod tests {
             })
             .collect();
         for &id in &per_chunk_ids {
-            scripted_responses.push(json!({"ids":[id]}).to_string());
+            scripted_responses.push(ids_json(&[id]));
         }
 
         let mut union_records: Vec<IndexRecord> = Vec::new();
@@ -692,7 +698,7 @@ mod tests {
         let union_snapshot = make_snapshot(&union_deduped);
 
         let rerank_ids = vec![2, 0];
-        scripted_responses.push(json!({"ids": rerank_ids}).to_string());
+        scripted_responses.push(ids_json(&rerank_ids));
 
         let mut expected_rel_paths: Vec<String> = Vec::new();
         for &id in &rerank_ids {
@@ -728,10 +734,7 @@ mod tests {
     #[test]
     fn parse_failure_rerolls_once_then_succeeds() {
         let records = vec![rec("a.jpg", "desc"), rec("b.jpg", "desc2")];
-        let chat = ScriptedFindChat::new(vec![
-            "not valid json".to_string(),
-            json!({"ids": [0]}).to_string(),
-        ]);
+        let chat = ScriptedFindChat::new(vec!["not valid json".to_string(), ids_json(&[0])]);
         let spend = crate::providers::new_spend();
         let data = find_with_options(
             "query",
@@ -781,10 +784,7 @@ mod tests {
     #[test]
     fn all_invalid_ids_reroll_then_error() {
         let records = vec![rec("a.jpg", "desc")];
-        let chat = ScriptedFindChat::new(vec![
-            json!({"ids": [999]}).to_string(),
-            json!({"ids": [999]}).to_string(),
-        ]);
+        let chat = ScriptedFindChat::new(vec![ids_json(&[999]), ids_json(&[999])]);
         let spend = crate::providers::new_spend();
         let result = find_with_options(
             "query",
@@ -823,7 +823,7 @@ mod tests {
     #[test]
     fn invalid_ids_dropped_is_structured_field_not_warning() {
         let records = vec![rec("a.jpg", "desc"), rec("b.jpg", "desc2")];
-        let chat = ScriptedFindChat::new(vec![json!({"ids": [99, 0]}).to_string()]);
+        let chat = ScriptedFindChat::new(vec![ids_json(&[99, 0])]);
         let spend = crate::providers::new_spend();
         let data = find_with_options(
             "query",

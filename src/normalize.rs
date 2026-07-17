@@ -374,13 +374,12 @@ mod tests {
         // TIFF header (little-endian)
         payload.extend_from_slice(&[0x49, 0x49, 0x2A, 0x00]); // II + magic 42
         payload.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]); // IFD offset = 8
-        // IFD: 1 entry
-        payload.extend_from_slice(&[0x01, 0x00]); // entry count = 1
+        payload.extend_from_slice(&[0x01, 0x00]);
         // Entry: tag 0x0112 (Orientation), type 3 (SHORT), count 1, value 6
-        payload.extend_from_slice(&[0x12, 0x01]); // tag
-        payload.extend_from_slice(&[0x03, 0x00]); // type = SHORT
-        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // count = 1
-        payload.extend_from_slice(&[0x06, 0x00, 0x00, 0x00]); // value = 6 + padding
+        payload.extend_from_slice(&[0x12, 0x01]);
+        payload.extend_from_slice(&[0x03, 0x00]);
+        payload.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]);
+        payload.extend_from_slice(&[0x06, 0x00, 0x00, 0x00]);
         // Next IFD offset = 0 (no more IFDs)
         payload.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
         // Length field (includes itself, 2 bytes)
@@ -409,9 +408,9 @@ mod tests {
         assert_eq!(&jpeg_bytes[..2], &[0xFF, 0xD8]);
         let app1 = build_exif_app1_orientation_6();
         let mut spliced = Vec::with_capacity(jpeg_bytes.len() + app1.len());
-        spliced.extend_from_slice(&jpeg_bytes[..2]); // SOI
+        spliced.extend_from_slice(&jpeg_bytes[..2]);
         spliced.extend_from_slice(&app1);
-        spliced.extend_from_slice(&jpeg_bytes[2..]); // rest of the JPEG
+        spliced.extend_from_slice(&jpeg_bytes[2..]);
         fs::write(&path, &spliced).unwrap();
 
         let out = normalize_image(&path, "jpg", false);

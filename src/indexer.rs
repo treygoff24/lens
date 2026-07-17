@@ -273,7 +273,7 @@ fn run_caption_work(
                     };
 
                     let output = caption_one(file, chat);
-                    reservation.settle(0.0);
+                    drop(reservation);
                     let _ = tx.send(Some(output));
                 }
             });
@@ -348,7 +348,7 @@ fn caption_one(file: WalkedFile, chat: &dyn CaptionChat) -> WorkerOutput {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[doc(hidden)]
 pub struct CaptionPayload {
     description: String,
@@ -532,7 +532,6 @@ mod tests {
     use super::*;
     use crate::error::Provider;
     use image::{ImageBuffer, Rgba};
-    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
@@ -586,14 +585,14 @@ mod tests {
     }
 
     fn caption_json(name: &str) -> String {
-        json!({
-            "description": format!("description {name}"),
-            "filename": name,
-            "tags": ["tag"],
-            "text_content": "",
-            "kind": "photo",
+        serde_json::to_string(&CaptionPayload {
+            description: format!("description {name}"),
+            filename: name.to_string(),
+            tags: vec!["tag".into()],
+            text_content: String::new(),
+            kind: "photo".into(),
         })
-        .to_string()
+        .unwrap()
     }
 
     fn fixture_library(count: usize) -> tempfile::TempDir {

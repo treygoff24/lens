@@ -39,14 +39,9 @@ impl Spend {
 }
 
 pub type SharedSpend = Arc<Mutex<Spend>>;
-pub type SleepFn = Arc<dyn Fn(Duration) + Send + Sync>;
 
 pub fn new_spend() -> SharedSpend {
     Arc::new(Mutex::new(Spend::default()))
-}
-
-pub(crate) fn default_sleep() -> SleepFn {
-    Arc::new(std::thread::sleep)
 }
 
 pub(crate) fn join_url(base_url: &str, path: &str) -> String {

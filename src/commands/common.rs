@@ -6,13 +6,23 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::envelope::{Budget, CostDollars, Diagnostics, SuccessEnvelope};
 use crate::error::{LensError, Provider};
+use crate::indexer::CAPTION_WORST_CASE_COST;
 use crate::providers::{SharedSpend, new_spend};
 use crate::store::Store;
+use crate::walk::{partition_with_stale_all, walk_library};
 
 pub struct CommandSuccess {
     pub envelope: SuccessEnvelope,
     pub exit_code: i32,
     pub hint: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct OutcomeData<T> {
+    #[serde(flatten)]
+    pub data: T,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -27,6 +37,42 @@ pub(crate) struct IndexStateData {
     pub vanished: usize,
     pub stale_all: bool,
     pub projected_wall_seconds: f64,
+}
+
+pub(crate) struct IndexState {
+    pub data: IndexStateData,
+    pub planned_work: usize,
+    pub projected_cost_dollars: f64,
+    pub warnings: Vec<String>,
+}
+
+pub(crate) fn load_index_state(
+    library_path: &Path,
+    store: &Store,
+    model: &str,
+    concurrency: u16,
+) -> Result<IndexState, LensError> {
+    let walked = walk_library(library_path)?;
+    let loaded = store.load(model)?;
+    let freshness = partition_with_stale_all(&walked, &loaded.records, loaded.stale_all);
+    let planned_work = freshness.stale.len() + freshness.new.len();
+
+    Ok(IndexState {
+        data: IndexStateData {
+            library_path: library_path.to_string_lossy().into_owned(),
+            index_path: store.dir().to_string_lossy().into_owned(),
+            indexed: loaded.records.len(),
+            fresh: freshness.fresh.len(),
+            stale: freshness.stale.len(),
+            new: freshness.new.len(),
+            vanished: freshness.vanished.len(),
+            stale_all: loaded.stale_all,
+            projected_wall_seconds: planned_work as f64 / f64::from(concurrency) * 1.5,
+        },
+        planned_work,
+        projected_cost_dollars: planned_work as f64 * CAPTION_WORST_CASE_COST,
+        warnings: loaded.warnings,
+    })
 }
 
 pub(crate) fn zero_envelope(command: &str, data: impl Serialize) -> SuccessEnvelope {

@@ -23,30 +23,12 @@ impl Budget {
         }
     }
 
-    /// Pre-launch projection gate. Returns `true` when the projected unit cost
-    /// fits within both the dollar and seconds caps; otherwise records the hit
-    /// reason (which sticks) and returns `false`.
-    ///
-    /// # Concurrency contract
-    ///
-    /// Callers should serialize the read of `spend` with `reserve` through a
-    /// gate mutex so the budget decision uses a consistent actual-spend
-    /// snapshot. The bound itself does not depend on that serialization:
-    /// outstanding reservations are counted before launch, and dropped or
-    /// settled reservations release their projected cost.
-    pub fn may_launch(&self, spend: &Spend, projected_unit_cost: f64) -> bool {
-        if self.hit.get().is_some() {
-            return false;
-        }
-        self.fits(spend, projected_unit_cost, *self.outstanding())
-    }
-
     /// Records a pre-launch reservation if actual spend plus outstanding
     /// reservations plus this projection fits within the caps.
     ///
-    /// Dropping the returned guard without settling releases the reservation,
-    /// so panicked workers cannot leak budget. `settle` also releases the
-    /// reservation; actual spend is recorded by the shared `Spend` meter.
+    /// Dropping the returned guard releases the reservation, so panicked
+    /// workers cannot leak budget. Actual spend is recorded by the shared
+    /// `Spend` meter.
     pub fn reserve(&self, spend: &Spend, projected_unit_cost: f64) -> Option<Reservation<'_>> {
         if self.hit.get().is_some() {
             return None;
@@ -61,7 +43,6 @@ impl Budget {
         Some(Reservation {
             budget: self,
             dollars: projected_unit_cost,
-            released: false,
         })
     }
 
@@ -102,25 +83,11 @@ impl Budget {
 pub struct Reservation<'a> {
     budget: &'a Budget,
     dollars: f64,
-    released: bool,
-}
-
-impl Reservation<'_> {
-    pub fn settle(mut self, _actual_dollars: f64) {
-        self.release();
-    }
-
-    fn release(&mut self) {
-        if !self.released {
-            self.budget.release(self.dollars);
-            self.released = true;
-        }
-    }
 }
 
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        self.release();
+        self.budget.release(self.dollars);
     }
 }
 
@@ -132,7 +99,6 @@ mod tests {
     fn no_caps_always_allows_launch() {
         let budget = Budget::new(None, None);
 
-        assert!(budget.may_launch(&Spend::default(), f64::MAX));
         assert!(budget.reserve(&Spend::default(), f64::MAX).is_some());
         assert_eq!(budget.hit(), None);
     }
@@ -145,14 +111,14 @@ mod tests {
             ..Spend::default()
         };
 
-        assert!(!budget.may_launch(&spend, 0.02));
+        assert!(budget.reserve(&spend, 0.02).is_none());
         assert_eq!(budget.hit(), Some("dollars"));
-        assert!(!budget.may_launch(&Spend::default(), 0.0));
+        assert!(budget.reserve(&Spend::default(), 0.0).is_none());
         assert_eq!(budget.hit(), Some("dollars"));
     }
 
     #[test]
-    fn reservations_count_outstanding_before_settle() {
+    fn reservations_count_outstanding_until_drop() {
         let budget = Budget::new(Some(0.10), None);
         let spend = Spend::default();
         let _first = budget.reserve(&spend, 0.05).unwrap();
@@ -174,21 +140,6 @@ mod tests {
     }
 
     #[test]
-    fn settling_reservation_releases_projected_cost() {
-        let budget = Budget::new(Some(0.10), None);
-        let reserved = budget.reserve(&Spend::default(), 0.06).unwrap();
-
-        reserved.settle(0.04);
-
-        let spend = Spend {
-            dollars: 0.04,
-            ..Spend::default()
-        };
-        assert!(budget.reserve(&spend, 0.06).is_some());
-        assert_eq!(budget.hit(), None);
-    }
-
-    #[test]
     fn reservation_hit_reason_sticks_after_release() {
         let budget = Budget::new(Some(0.10), None);
         let first = budget.reserve(&Spend::default(), 0.07).unwrap();
@@ -196,7 +147,7 @@ mod tests {
         assert!(budget.reserve(&Spend::default(), 0.04).is_none());
         assert_eq!(budget.hit(), Some("dollars"));
 
-        first.settle(0.07);
+        drop(first);
         assert!(budget.reserve(&Spend::default(), 0.0).is_none());
         assert_eq!(budget.hit(), Some("dollars"));
     }
@@ -206,7 +157,7 @@ mod tests {
         let budget = Budget::new(None, Some(0));
         std::thread::sleep(Duration::from_millis(2));
 
-        assert!(!budget.may_launch(&Spend::default(), 0.0));
+        assert!(budget.reserve(&Spend::default(), 0.0).is_none());
         assert_eq!(budget.hit(), Some("seconds"));
     }
 

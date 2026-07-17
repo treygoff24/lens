@@ -8,12 +8,13 @@ use serde::Serialize;
 use crate::budget::Budget as RunBudget;
 use crate::cli::{FindArgs, GlobalArgs};
 use crate::commands::common::{
-    CommandSuccess, estimated_envelope, metered_envelope, model_from, new_shared_spend, open_store,
-    require_key, resolve_library_path, response_value, zero_cost_success,
+    CommandSuccess, OutcomeData, estimated_envelope, metered_envelope, model_from,
+    new_shared_spend, open_store, require_key, resolve_library_path, response_value,
+    zero_cost_success,
 };
 use crate::config::Config;
 use crate::error::LensError;
-use crate::find::{FindContext, FindData, FindHit, FindOptions, find_with_options, plan};
+use crate::find::{FindContext, FindData, FindOptions, find_with_options, plan};
 use crate::providers::cerebras::CerebrasClient;
 use crate::store::IndexRecord;
 
@@ -27,28 +28,6 @@ struct FindDryRunData<'a> {
     warnings: Vec<String>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     kind_filter: &'a [String],
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EmptyFindData<'a> {
-    query: &'a str,
-    hits: [FindHit; 0],
-    searched: usize,
-    mode: String,
-    chunks: usize,
-    warnings: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    outcome: Option<&'static str>,
-    #[serde(skip_serializing_if = "<[String]>::is_empty")]
-    kind_filter: &'a [String],
-}
-
-#[derive(Serialize)]
-struct AnsweredFindData {
-    #[serde(flatten)]
-    data: FindData,
-    outcome: &'static str,
 }
 
 pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensError> {
@@ -106,17 +85,18 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
     }
 
     if unfiltered_count == 0 {
+        let data = empty_find_data(
+            &args.query,
+            &loaded.records,
+            args.top,
+            vec!["index is empty; run lens index".into()],
+            &[],
+        );
         return zero_cost_success(
             "find",
-            EmptyFindData {
-                query: &args.query,
-                hits: [],
-                searched: 0,
-                mode: "single_shot".into(),
-                chunks: 0,
-                warnings: vec!["index is empty; run lens index".into()],
+            OutcomeData {
+                data,
                 outcome: None,
-                kind_filter: &[],
             },
             &started,
             "run `lens index --json` before searching this library",
@@ -126,17 +106,18 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
     if let Some(warning) = zero_kind_warning {
         let mut warnings = loaded.warnings;
         warnings.push(warning);
+        let data = empty_find_data(
+            &args.query,
+            &loaded.records,
+            args.top,
+            warnings,
+            &kind_filter,
+        );
         return zero_cost_success(
             "find",
-            EmptyFindData {
-                query: &args.query,
-                hits: [],
-                searched: 0,
-                mode: "single_shot".into(),
-                chunks: 0,
-                warnings,
+            OutcomeData {
+                data,
                 outcome: Some("answered"),
-                kind_filter: &kind_filter,
             },
             &started,
             "try a --kind value present in the index",
@@ -179,25 +160,25 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
             }
             response_value(
                 "find data",
-                AnsweredFindData {
+                OutcomeData {
                     data,
-                    outcome: "answered",
+                    outcome: Some("answered"),
                 },
             )?
         }
         Err(err) if err.exit_code() == 10 && budget.hit().is_some() => {
-            let plan = plan(&args.query, &loaded.records, args.top);
+            let data = empty_find_data(
+                &args.query,
+                &loaded.records,
+                args.top,
+                vec!["budget refused find call".into()],
+                &kind_filter,
+            );
             response_value(
                 "find data",
-                EmptyFindData {
-                    query: &args.query,
-                    hits: [],
-                    searched: loaded.records.len(),
-                    mode: plan.mode,
-                    chunks: plan.chunks,
-                    warnings: vec!["budget refused find call".into()],
+                OutcomeData {
+                    data,
                     outcome: Some("refused"),
-                    kind_filter: &kind_filter,
                 },
             )?
         }
@@ -210,6 +191,27 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
         exit_code,
         hint: Some("use --gallery PATH to write a contact sheet for human review"),
     })
+}
+
+fn empty_find_data(
+    query: &str,
+    records: &[IndexRecord],
+    top: usize,
+    warnings: Vec<String>,
+    kind_filter: &[String],
+) -> FindData {
+    let plan = plan(query, records, top);
+    FindData {
+        query: query.to_string(),
+        hits: Vec::new(),
+        searched: plan.searched,
+        mode: plan.mode,
+        chunks: plan.chunks,
+        warnings,
+        kind_filter: kind_filter.to_vec(),
+        invalid_ids_dropped: 0,
+        gallery_path: None,
+    }
 }
 
 fn normalize_kind(kind: &str) -> String {

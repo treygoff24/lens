@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
 
 pub(super) struct MockServer {
     base_url: String,
@@ -27,8 +27,65 @@ struct MockState {
     captions: Mutex<VecDeque<String>>,
     find_ids: Mutex<VecDeque<Vec<i64>>>,
     find_router: Mutex<FindRouter>,
-    /// Optional canned raw content for find responses (for bad-JSON tests).
     find_raw: Mutex<VecDeque<String>>,
+}
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    response_format: Option<ResponseFormat>,
+}
+
+#[derive(Deserialize)]
+struct ResponseFormat {
+    json_schema: JsonSchema,
+}
+
+#[derive(Deserialize)]
+struct JsonSchema {
+    name: String,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum MockResponse {
+    Error { error: &'static str },
+    Chat(MockChatResponse),
+}
+
+#[derive(Serialize)]
+struct MockChatResponse {
+    choices: [MockChoice; 1],
+    usage: MockUsage,
+}
+
+#[derive(Serialize)]
+struct MockChoice {
+    message: MockMessage,
+}
+
+#[derive(Serialize)]
+struct MockMessage {
+    content: String,
+}
+
+#[derive(Serialize)]
+struct MockUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+#[derive(Serialize)]
+struct IdsResponse<'a> {
+    ids: &'a [i64],
+}
+
+#[derive(Serialize)]
+struct CaptionResponse<'a> {
+    description: &'a str,
+    filename: &'static str,
+    tags: [&'static str; 2],
+    text_content: &'static str,
+    kind: &'static str,
 }
 
 impl MockServer {
@@ -71,8 +128,10 @@ impl MockServer {
             while thread_running.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         thread_requests.fetch_add(1, Ordering::SeqCst);
-                        handle_client(stream, &thread_state, &thread_last_body);
+                        handle_client(stream, &thread_state, &thread_last_body)
+                            .expect("mock server handles client request");
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -107,7 +166,6 @@ impl MockServer {
 impl Drop for MockServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.base_url.trim_start_matches("http://"));
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -118,23 +176,20 @@ fn handle_client(
     mut stream: TcpStream,
     state: &MockState,
     last_request_body: &Mutex<Option<String>>,
-) {
-    let Ok((path, body, headers)) = read_request(&mut stream) else {
-        return;
-    };
+) -> std::io::Result<()> {
+    let (path, body, headers) = read_request(&mut stream)?;
     *last_request_body.lock().unwrap() = Some(body.clone());
     if headers
         .lines()
         .any(|line| line.eq_ignore_ascii_case("authorization: bearer bad-cerebras"))
     {
-        write_json(&mut stream, 401, &json!({"error":"bad key"}));
-        return;
+        return write_json(&mut stream, 401, &MockResponse::Error { error: "bad key" });
     }
     let response = match path.as_str() {
         "/chat/completions" => chat_response(&body, state),
-        _ => (404, json!({"error":"not found"})),
+        _ => (404, MockResponse::Error { error: "not found" }),
     };
-    write_json(&mut stream, response.0, &response.1);
+    write_json(&mut stream, response.0, &response.1)
 }
 
 fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String, String)> {
@@ -155,40 +210,46 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String, Stri
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .map(|idx| idx + 4)
-        .unwrap_or(buf.len());
-    let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing HTTP header terminator"))?;
+    let headers = String::from_utf8(buf[..header_end].to_vec())
+        .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
     let path = headers
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/")
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing HTTP request path"))?
         .to_string();
     let content_length = headers
         .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })
-        .unwrap_or(0);
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "missing content-length header"))?
+        .1
+        .trim()
+        .parse::<usize>()
+        .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
 
     while buf.len() < header_end + content_length {
         let n = stream.read(&mut tmp)?;
         if n == 0 {
-            break;
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "HTTP request body ended before content-length",
+            ));
         }
         buf.extend_from_slice(&tmp[..n]);
     }
-    let body = String::from_utf8_lossy(&buf[header_end..header_end + content_length]).to_string();
+    let body = String::from_utf8(buf[header_end..header_end + content_length].to_vec())
+        .map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
     Ok((path, body, headers))
 }
 
-fn chat_response(body: &str, state: &MockState) -> (u16, Value) {
-    let body: Value = serde_json::from_str(body).expect("client request is valid JSON");
-    let schema_name = body
-        .pointer("/response_format/json_schema/name")
-        .and_then(Value::as_str);
+fn chat_response(body: &str, state: &MockState) -> (u16, MockResponse) {
+    let request: ChatRequest = serde_json::from_str(body).expect("client request is valid JSON");
+    let schema_name = request
+        .response_format
+        .as_ref()
+        .map(|format| format.json_schema.name.as_str());
     match schema_name {
         Some("image_index") => {
             let description = state
@@ -200,11 +261,10 @@ fn chat_response(body: &str, state: &MockState) -> (u16, Value) {
             (200, chat_content(caption_json(&description)))
         }
         Some("hits") => {
-            let raw_body = serde_json::to_string(&body).expect("JSON value serializes");
             let router = state.find_router.lock().unwrap();
             for (marker, ids) in router.iter() {
-                if raw_body.contains(marker) {
-                    return (200, chat_content(json!({"ids": ids}).to_string()));
+                if body.contains(marker) {
+                    return (200, chat_content(ids_json(ids)));
                 }
             }
             drop(router);
@@ -219,36 +279,45 @@ fn chat_response(body: &str, state: &MockState) -> (u16, Value) {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| vec![0]);
-            (200, chat_content(json!({"ids": ids}).to_string()))
+            (200, chat_content(ids_json(&ids)))
         }
         _ => (200, chat_content("ok".to_string())),
     }
 }
 
 fn caption_json(description: &str) -> String {
-    json!({
-        "description": description,
-        "filename": "mock-image",
-        "tags": ["mock", "fixture"],
-        "text_content": "fixture text",
-        "kind": "photo"
+    serde_json::to_string(&CaptionResponse {
+        description,
+        filename: "mock-image",
+        tags: ["mock", "fixture"],
+        text_content: "fixture text",
+        kind: "photo",
     })
-    .to_string()
+    .unwrap()
 }
 
-fn chat_content(content: String) -> Value {
-    json!({
-        "choices": [{"message": {"content": content}}],
-        "usage": {"prompt_tokens": 1000, "completion_tokens": 1000}
+fn ids_json(ids: &[i64]) -> String {
+    serde_json::to_string(&IdsResponse { ids }).unwrap()
+}
+
+fn chat_content(content: String) -> MockResponse {
+    MockResponse::Chat(MockChatResponse {
+        choices: [MockChoice {
+            message: MockMessage { content },
+        }],
+        usage: MockUsage {
+            prompt_tokens: 1000,
+            completion_tokens: 1000,
+        },
     })
 }
 
-fn write_json(stream: &mut TcpStream, status: u16, value: &Value) {
+fn write_json(stream: &mut TcpStream, status: u16, value: &impl Serialize) -> std::io::Result<()> {
     let reason = if status == 200 { "OK" } else { "Error" };
     let body = serde_json::to_string(value).unwrap();
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
-    let _ = stream.write_all(response.as_bytes());
+    stream.write_all(response.as_bytes())
 }

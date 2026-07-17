@@ -357,13 +357,21 @@ fn finish_atomic_write(file: &mut File, tmp: &Path, path: &Path) -> Result<(), L
         .map_err(|err| LensError::config(format!("failed to replace {}: {err}", path.display())))
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LockMetadata {
+    pid: u32,
+    started_at: String,
+}
+
 fn create_lock_file(path: &Path) -> std::io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    let body = serde_json::json!({
-        "pid": std::process::id(),
-        "startedAt": rfc3339_now(),
-    });
-    writeln!(file, "{body}")?;
+    let body = LockMetadata {
+        pid: std::process::id(),
+        started_at: rfc3339_now(),
+    };
+    serde_json::to_writer(&mut file, &body)?;
+    writeln!(file)?;
     file.flush()
 }
 
