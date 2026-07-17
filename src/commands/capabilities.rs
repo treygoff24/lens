@@ -1,4 +1,6 @@
-use serde_json::json;
+use std::collections::BTreeMap;
+
+use serde::Serialize;
 
 use crate::cli::GlobalArgs;
 use crate::commands::{CommandSuccess, zero_envelope};
@@ -6,59 +8,309 @@ use crate::config::{DEFAULT_API_BASE, DEFAULT_MAX_CONCURRENCY, DEFAULT_MODEL};
 use crate::error::LensError;
 use crate::indexer::CAPTION_WORST_CASE_COST;
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CapabilitiesData {
+    name: &'static str,
+    version: &'static str,
+    schema: &'static str,
+    commands: Vec<CommandCapability>,
+    global_flags: Vec<GlobalFlag>,
+    exit_codes: BTreeMap<&'static str, &'static str>,
+    env_vars: Vec<EnvVar>,
+    skip_reasons: [&'static str; 4],
+    cost_expectations: CostExpectations,
+    index_storage: &'static str,
+    schemas: SchemaCommands,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandCapability {
+    name: &'static str,
+    usage: &'static str,
+    read_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_only_note: Option<&'static str>,
+    destructive: bool,
+    spends_money: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spends_money_note: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    writes_index: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stdout: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stderr_on_error: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct GlobalFlag {
+    name: &'static str,
+    #[serde(rename = "type")]
+    value_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minimum: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maximum: Option<u64>,
+    default: Option<CapabilityDefault>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CapabilityDefault {
+    Bool(bool),
+    Number(u64),
+    String(&'static str),
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvVar {
+    name: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    required_for: Option<&'static [&'static str]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<CapabilityDefault>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CostExpectations {
+    caption_measured_average_dollars: f64,
+    caption_worst_case_dollars: f64,
+    prototype_run: &'static str,
+    find: &'static str,
+}
+
+#[derive(Serialize)]
+struct SchemaCommands {
+    response: &'static str,
+    error: &'static str,
+    all: &'static str,
+}
+
 pub fn run(_global: &GlobalArgs) -> Result<CommandSuccess, LensError> {
-    let data = json!({
-        "name": "lens",
-        "version": env!("CARGO_PKG_VERSION"),
-        "schema": "lens.cli.capabilities.v1",
-        "commands": [
-            {"name": "index", "usage": "lens index [DIR]", "readOnly": false, "destructive": false, "spendsMoney": true, "writesIndex": true, "stdout": "lens.cli.response.v1", "stderrOnError": "lens.cli.error.v1"},
-            {"name": "find", "usage": "lens find <QUERY> [--dir DIR] [--top N] [--kind KIND] [--gallery PATH]", "readOnly": true, "readOnlyNote": "read-only on the library; --gallery writes the requested HTML file", "destructive": false, "spendsMoney": true},
-            {"name": "status", "usage": "lens status [--dir DIR]", "readOnly": true, "destructive": false, "spendsMoney": false},
-            {"name": "doctor", "usage": "lens doctor [--online]", "readOnly": true, "destructive": false, "spendsMoney": true, "spendsMoneyNote": "only with --online"},
-            {"name": "capabilities", "usage": "lens capabilities", "readOnly": true, "destructive": false, "spendsMoney": false},
-            {"name": "schema", "usage": "lens schema [response|error|all]", "readOnly": true, "destructive": false, "spendsMoney": false}
+    let data = CapabilitiesData {
+        name: "lens",
+        version: env!("CARGO_PKG_VERSION"),
+        schema: "lens.cli.capabilities.v1",
+        commands: commands(),
+        global_flags: global_flags(),
+        exit_codes: [
+            ("0", "ok"),
+            ("1", "usage"),
+            (
+                "2",
+                "auth; doctor emits its structured report on stdout even at exit 2",
+            ),
+            ("3", "config"),
+            ("4", "network"),
+            ("5", "upstream"),
+            ("6", "rate-limit"),
+            (
+                "10",
+                "partial/refused; stdout carries ok:true success envelope with budget.hit set",
+            ),
+            ("11", "no-input"),
+        ]
+        .into_iter()
+        .collect(),
+        env_vars: env_vars(),
+        skip_reasons: [
+            "unsupported_format",
+            "corrupt_image",
+            "too_large",
+            "budget_refused",
         ],
-        "globalFlags": [
-            {"name": "--json", "type": "bool", "default": false},
-            {"name": "--model", "type": "string", "default": DEFAULT_MODEL},
-            {"name": "--max-dollars", "type": "number", "minimum": 0, "default": null},
-            {"name": "--max-seconds", "type": "integer", "minimum": 1, "default": null},
-            {"name": "--index-path", "type": "path", "default": "XDG data dir keyed by library path"},
-            {"name": "--dry-run", "type": "bool", "default": false},
-            {"name": "--concurrency", "type": "integer", "minimum": 1, "maximum": 50, "default": 25}
-        ],
-        "exitCodes": {
-            "0": "ok",
-            "1": "usage",
-            "2": "auth; doctor emits its structured report on stdout even at exit 2",
-            "3": "config",
-            "4": "network",
-            "5": "upstream",
-            "6": "rate-limit",
-            "10": "partial/refused; stdout carries ok:true success envelope with budget.hit set",
-            "11": "no-input"
+        cost_expectations: CostExpectations {
+            caption_measured_average_dollars: 0.00166,
+            caption_worst_case_dollars: CAPTION_WORST_CASE_COST,
+            prototype_run: "1100 images ≈ 93s ≈ $2.29 (measured 2026-07-02)",
+            find: "pennies; projected from serialized index tokens",
         },
-        "envVars": [
-            {"name": "CEREBRAS_API_KEY", "requiredFor": ["index", "find", "doctor --online"], "secret": true},
-            {"name": "LENS_API_BASE", "default": DEFAULT_API_BASE},
-            {"name": "LENS_MODEL", "default": DEFAULT_MODEL},
-            {"name": "LENS_MAX_CONCURRENCY", "default": DEFAULT_MAX_CONCURRENCY},
-            {"name": "XDG_DATA_HOME", "default": "~/.local/share"}
-        ],
-        "skipReasons": ["unsupported_format", "corrupt_image", "too_large", "budget_refused"],
-        "costExpectations": {
-            "captionMeasuredAverageDollars": 0.00166,
-            "captionWorstCaseDollars": CAPTION_WORST_CASE_COST,
-            "prototypeRun": "1100 images ≈ 93s ≈ $2.29 (measured 2026-07-02)",
-            "find": "pennies; projected from serialized index tokens"
+        index_storage: "${XDG_DATA_HOME:-~/.local/share}/lens/libraries/<sha256(canonical_path)[..16]>/",
+        schemas: SchemaCommands {
+            response: "lens schema response",
+            error: "lens schema error",
+            all: "lens schema all",
         },
-        "indexStorage": "${XDG_DATA_HOME:-~/.local/share}/lens/libraries/<sha256(canonical_path)[..16]>/",
-        "schemas": {"response": "lens schema response", "error": "lens schema error", "all": "lens schema all"}
-    });
+    };
     Ok(CommandSuccess {
         envelope: zero_envelope("capabilities", data),
         exit_code: 0,
         hint: None,
     })
+}
+
+fn commands() -> Vec<CommandCapability> {
+    vec![
+        CommandCapability {
+            name: "index",
+            usage: "lens index [DIR]",
+            read_only: false,
+            read_only_note: None,
+            destructive: false,
+            spends_money: true,
+            spends_money_note: None,
+            writes_index: Some(true),
+            stdout: Some("lens.cli.response.v1"),
+            stderr_on_error: Some("lens.cli.error.v1"),
+        },
+        CommandCapability {
+            name: "find",
+            usage: "lens find <QUERY> [--dir DIR] [--top N] [--kind KIND] [--gallery PATH]",
+            read_only: true,
+            read_only_note: Some(
+                "read-only on the library; --gallery writes the requested HTML file",
+            ),
+            destructive: false,
+            spends_money: true,
+            spends_money_note: None,
+            writes_index: None,
+            stdout: None,
+            stderr_on_error: None,
+        },
+        CommandCapability {
+            name: "status",
+            usage: "lens status [--dir DIR]",
+            read_only: true,
+            read_only_note: None,
+            destructive: false,
+            spends_money: false,
+            spends_money_note: None,
+            writes_index: None,
+            stdout: None,
+            stderr_on_error: None,
+        },
+        CommandCapability {
+            name: "doctor",
+            usage: "lens doctor [--online]",
+            read_only: true,
+            read_only_note: None,
+            destructive: false,
+            spends_money: true,
+            spends_money_note: Some("only with --online"),
+            writes_index: None,
+            stdout: None,
+            stderr_on_error: None,
+        },
+        CommandCapability {
+            name: "capabilities",
+            usage: "lens capabilities",
+            read_only: true,
+            read_only_note: None,
+            destructive: false,
+            spends_money: false,
+            spends_money_note: None,
+            writes_index: None,
+            stdout: None,
+            stderr_on_error: None,
+        },
+        CommandCapability {
+            name: "schema",
+            usage: "lens schema [response|error|all]",
+            read_only: true,
+            read_only_note: None,
+            destructive: false,
+            spends_money: false,
+            spends_money_note: None,
+            writes_index: None,
+            stdout: None,
+            stderr_on_error: None,
+        },
+    ]
+}
+
+fn global_flags() -> Vec<GlobalFlag> {
+    vec![
+        GlobalFlag {
+            name: "--json",
+            value_type: "bool",
+            minimum: None,
+            maximum: None,
+            default: Some(CapabilityDefault::Bool(false)),
+        },
+        GlobalFlag {
+            name: "--model",
+            value_type: "string",
+            minimum: None,
+            maximum: None,
+            default: Some(CapabilityDefault::String(DEFAULT_MODEL)),
+        },
+        GlobalFlag {
+            name: "--max-dollars",
+            value_type: "number",
+            minimum: Some(0),
+            maximum: None,
+            default: None,
+        },
+        GlobalFlag {
+            name: "--max-seconds",
+            value_type: "integer",
+            minimum: Some(1),
+            maximum: None,
+            default: None,
+        },
+        GlobalFlag {
+            name: "--index-path",
+            value_type: "path",
+            minimum: None,
+            maximum: None,
+            default: Some(CapabilityDefault::String(
+                "XDG data dir keyed by library path",
+            )),
+        },
+        GlobalFlag {
+            name: "--dry-run",
+            value_type: "bool",
+            minimum: None,
+            maximum: None,
+            default: Some(CapabilityDefault::Bool(false)),
+        },
+        GlobalFlag {
+            name: "--concurrency",
+            value_type: "integer",
+            minimum: Some(1),
+            maximum: Some(50),
+            default: Some(CapabilityDefault::Number(25)),
+        },
+    ]
+}
+
+fn env_vars() -> Vec<EnvVar> {
+    vec![
+        EnvVar {
+            name: "CEREBRAS_API_KEY",
+            required_for: Some(&["index", "find", "doctor --online"]),
+            secret: Some(true),
+            default: None,
+        },
+        EnvVar {
+            name: "LENS_API_BASE",
+            required_for: None,
+            secret: None,
+            default: Some(CapabilityDefault::String(DEFAULT_API_BASE)),
+        },
+        EnvVar {
+            name: "LENS_MODEL",
+            required_for: None,
+            secret: None,
+            default: Some(CapabilityDefault::String(DEFAULT_MODEL)),
+        },
+        EnvVar {
+            name: "LENS_MAX_CONCURRENCY",
+            required_for: None,
+            secret: None,
+            default: Some(CapabilityDefault::Number(DEFAULT_MAX_CONCURRENCY as u64)),
+        },
+        EnvVar {
+            name: "XDG_DATA_HOME",
+            required_for: None,
+            secret: None,
+            default: Some(CapabilityDefault::String("~/.local/share")),
+        },
+    ]
 }

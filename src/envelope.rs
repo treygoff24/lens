@@ -16,7 +16,7 @@ fn new_request_id(request_id: Option<String>) -> String {
 
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("system clock is after the Unix epoch")
             .as_nanos();
         let bits = nanos
             ^ ((COUNTER.fetch_add(1, Ordering::Relaxed) as u128) << 64)
@@ -42,7 +42,7 @@ pub struct CostDollars {
     pub estimated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Budget {
     /// "dollars" | "seconds" | null
     pub hit: Option<String>,
@@ -198,7 +198,7 @@ fn render_success_human(env: &SuccessEnvelope) {
     );
     println!(
         "{}",
-        serde_json::to_string_pretty(&env.data).unwrap_or_else(|_| env.data.to_string())
+        serde_json::to_string_pretty(&env.data).expect("JSON value serializes")
     );
 }
 
@@ -223,7 +223,7 @@ fn render_error_human_to(env: &ErrorEnvelope, writer: &mut impl Write) -> io::Re
         writeln!(
             writer,
             "partial: {}",
-            serde_json::to_string_pretty(partial).unwrap_or_else(|_| partial.to_string())
+            serde_json::to_string_pretty(partial).expect("JSON value serializes")
         )?;
     }
     if let Some(suggested_fix) = &env.error.suggested_fix {
@@ -273,7 +273,6 @@ mod tests {
         assert_eq!(json["diagnostics"]["durationMs"], 12100);
         assert_eq!(json["diagnostics"]["retries"], 0);
 
-        // No snake_case leakage.
         assert!(json.get("request_id").is_none());
         assert!(json.get("cost_dollars").is_none());
         assert!(json["diagnostics"].get("duration_ms").is_none());
@@ -309,7 +308,6 @@ mod tests {
         );
 
         assert!(json.get("request_id").is_none());
-        // exit_code is intentionally not part of the JSON contract.
         assert!(json.get("exitCode").is_none());
         assert!(json.get("exit_code").is_none());
 

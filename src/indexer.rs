@@ -7,13 +7,14 @@ use std::time::Instant;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::budget::Budget;
 use crate::error::LensError;
 use crate::normalize::{NormalizeOutput, normalize_image};
 use crate::providers::Spend;
-use crate::providers::cerebras::{CerebrasClient, ChatOpts, ChatResponse, Message, json_repair};
+use crate::providers::cerebras::{
+    CerebrasClient, ChatOpts, ChatResponse, JsonSchema, Message, ResponseFormat, json_repair,
+};
 use crate::store::{IndexRecord, Store};
 use crate::walk::{WalkedFile, partition_freshness, walk_library};
 
@@ -37,9 +38,7 @@ pub struct IndexReport {
     pub stale: usize,
     pub new: usize,
     pub vanished: usize,
-    /// Warnings collected during the run (store-load warnings, stale_all
-    /// notice, lock-steal warning). In JSON mode these ride the envelope
-    /// instead of raw stderr (F2+F3).
+    /// Structured warnings for the JSON envelope and human stderr renderer.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -58,10 +57,21 @@ pub struct FailureReport {
     pub error: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct BudgetReport {
-    pub hit: Option<String>,
+fn skip_report(rel_path: String, reason: impl ToString) -> SkipReport {
+    SkipReport {
+        rel_path,
+        reason: reason.to_string(),
+    }
 }
+
+fn failure_report(rel_path: String, error: impl ToString) -> FailureReport {
+    FailureReport {
+        rel_path,
+        error: error.to_string(),
+    }
+}
+
+pub type BudgetReport = crate::envelope::Budget;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexOutcome {
@@ -93,13 +103,9 @@ impl IndexOptions {
 }
 
 pub trait CaptionChat: Sync {
-    /// `terse` selects the bounded-transcription prompt used on re-rolls:
-    /// text-dense images (brochures, infographics) can blow the completion cap
-    /// mid-JSON on the full prompt, which parses as truncated JSON every time.
-    /// Measured live 2026-07-01: 29/1,100 corpus images failed deterministically
-    /// until the terse re-roll was added. Does not bump promptVersion — the
-    /// primary prompt is unchanged and terse mode only runs for files that
-    /// previously produced no index row at all.
+    /// `terse` bounds transcription on retries after the full prompt exhausts
+    /// the completion cap mid-JSON. It leaves `promptVersion` unchanged because
+    /// the primary prompt and stored rows are unchanged.
     fn caption_chat(&self, jpeg_bytes: &[u8], terse: bool) -> Result<ChatResponse, LensError>;
     fn spend_snapshot(&self) -> Spend;
 }
@@ -125,10 +131,7 @@ impl CaptionChat for CerebrasClient {
     }
 
     fn spend_snapshot(&self) -> Spend {
-        self.spend()
-            .lock()
-            .map(|spend| spend.clone())
-            .unwrap_or_default()
+        CerebrasClient::spend_snapshot(self)
     }
 }
 
@@ -142,8 +145,7 @@ pub fn index_library(
     let start = Instant::now();
     let (_lock, lock_warning) = store.lock()?;
 
-    // F2+F3: collect warnings into a Vec<String> instead of eprintln. The
-    // commands layer decides whether to print them to stderr (human mode only).
+    // Keep warnings structured until the command chooses JSON or human output.
     let mut warnings = Vec::new();
     if let Some(w) = lock_warning {
         warnings.push(w);
@@ -156,18 +158,11 @@ pub fn index_library(
         warnings.push("index metadata is stale; recaptioning all files".to_string());
     }
 
-    // Always partition so we know which files truly vanished from the library
-    // (F2: stale_all must still prune vanished files, not fabricate an empty
-    // vanished list). When the whole index is stale, move everything that still
-    // exists into the stale bucket so it gets recaptioned, while keeping the
-    // real vanished list.
+    // Partition first so a stale model still distinguishes recaption candidates
+    // from files that truly vanished and must be pruned.
     let mut freshness = partition_freshness(&walked, &loaded.records);
     if loaded.stale_all {
-        let mut recaption = std::mem::take(&mut freshness.fresh);
-        recaption.append(&mut freshness.new);
-        freshness.stale.extend(recaption);
-        freshness.new = Vec::new();
-        freshness.fresh = Vec::new();
+        freshness.mark_all_stale();
     }
 
     let mut work = freshness
@@ -186,10 +181,8 @@ pub fn index_library(
 
     let run = run_caption_work(work, chat, budget, options.concurrency, store)?;
 
-    // F1: keep old records for stale paths (a recaption that skipped/failed
-    // must not lose its previous good caption). Only vanished paths get
-    // filtered. New records are appended after old ones so rewrite_last_wins
-    // resolves replacements with the new record winning.
+    // Retain stale rows until recaption succeeds; last-wins replaces successes
+    // without losing good captions when normalization or captioning fails.
     let mut records = loaded
         .records
         .into_iter()
@@ -262,14 +255,11 @@ fn run_caption_work(
             scope.spawn(move || {
                 loop {
                     let (file, reservation) = {
-                        let _gate = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let _gate = gate.lock().unwrap();
                         if budget.hit().is_some() {
                             return;
                         }
-                        let file = queue
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .pop_front();
+                        let file = queue.lock().unwrap().pop_front();
                         let Some(file) = file else {
                             return;
                         };
@@ -277,10 +267,10 @@ fn run_caption_work(
                         let Some(reservation) =
                             budget.reserve(&spend_snapshot, CAPTION_WORST_CASE_COST)
                         else {
-                            let _ = tx.send(Some(WorkerOutput::Skipped(SkipReport {
-                                rel_path: file.rel_path,
-                                reason: "budget_refused".to_string(),
-                            })));
+                            let _ = tx.send(Some(WorkerOutput::Skipped(skip_report(
+                                file.rel_path,
+                                "budget_refused",
+                            ))));
                             let _ = tx.send(None);
                             return;
                         };
@@ -297,20 +287,13 @@ fn run_caption_work(
         collect_worker_outputs(rx, store)
     })?;
 
-    // F3: workers that see budget.hit() return silently, leaving the rest of
-    // the queue unreported. Drain the leftover queue and emit a budget_refused
-    // skip for every file that was never picked up.
+    // Workers stop silently on a budget hit, so account for every queued file.
     if state.budget_hit {
-        let leftover = queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-            .collect::<Vec<_>>();
+        let leftover = queue.lock().unwrap().drain(..).collect::<Vec<_>>();
         for file in leftover {
-            state.skipped.push(SkipReport {
-                rel_path: file.rel_path,
-                reason: "budget_refused".to_string(),
-            });
+            state
+                .skipped
+                .push(skip_report(file.rel_path, "budget_refused"));
         }
     }
 
@@ -341,16 +324,13 @@ fn caption_one(file: WalkedFile, chat: &dyn CaptionChat) -> WorkerOutput {
     let ext = Path::new(&file.rel_path)
         .extension()
         .and_then(|ext| ext.to_str())
-        .unwrap_or_default()
+        .expect("walked image has a UTF-8 extension")
         .to_string();
 
     let normalized = match normalize_image(&file.abs_path, &ext, false) {
         NormalizeOutput::Normalized(normalized) => normalized,
         NormalizeOutput::Skip { reason, .. } => {
-            return WorkerOutput::Skipped(SkipReport {
-                rel_path: file.rel_path,
-                reason: reason.to_string(),
-            });
+            return WorkerOutput::Skipped(skip_report(file.rel_path, reason));
         }
     };
 
@@ -361,22 +341,15 @@ fn caption_one(file: WalkedFile, chat: &dyn CaptionChat) -> WorkerOutput {
                 NormalizeOutput::Normalized(reencoded) => {
                     match caption_normalized(&reencoded.jpeg_bytes, chat) {
                         Ok(caption) => WorkerOutput::Indexed(record_from_caption(file, caption)),
-                        Err(err) => WorkerOutput::Failed(FailureReport {
-                            rel_path: file.rel_path,
-                            error: err.to_string(),
-                        }),
+                        Err(err) => WorkerOutput::Failed(failure_report(file.rel_path, err)),
                     }
                 }
-                NormalizeOutput::Skip { reason, .. } => WorkerOutput::Skipped(SkipReport {
-                    rel_path: file.rel_path,
-                    reason: reason.to_string(),
-                }),
+                NormalizeOutput::Skip { reason, .. } => {
+                    WorkerOutput::Skipped(skip_report(file.rel_path, reason))
+                }
             }
         }
-        Err(err) => WorkerOutput::Failed(FailureReport {
-            rel_path: file.rel_path,
-            error: err.to_string(),
-        }),
+        Err(err) => WorkerOutput::Failed(failure_report(file.rel_path, err)),
     }
 }
 
@@ -417,7 +390,7 @@ fn caption_normalized(
                 // Parse failure is dominated by cap-truncated output: either a
                 // text-dense image transcribed past the cap, or a degeneration
                 // loop (model hallucinates repeating text in photo texture).
-                // The terse prompt + low temperature clears the first class.
+                // Bounded transcription and low temperature avoid both failure modes.
                 let reroll = chat
                     .caption_chat(jpeg_bytes, true)
                     .map_err(map_caption_error)?;
@@ -447,7 +420,6 @@ fn salvage_caption(content: &str) -> Option<CaptionPayload> {
     let after_key = &repaired[start + "\"description\"".len()..];
     let quote = after_key.find('"')?;
     let body = &after_key[quote + 1..];
-    // Scan to the closing quote, honoring escapes; on truncation take what we have.
     let mut end = body.len();
     let mut chars = body.char_indices();
     while let Some((i, c)) = chars.next() {
@@ -463,7 +435,6 @@ fn salvage_caption(content: &str) -> Option<CaptionPayload> {
         }
     }
     let mut description: String = body[..end].chars().take(500).collect();
-    // A truncated tail can end mid-escape; drop trailing backslashes.
     while description.ends_with('\\') {
         description.pop();
     }
@@ -518,26 +489,46 @@ fn record_from_caption(file: WalkedFile, caption: CaptionPayload) -> IndexRecord
     }
 }
 
-fn caption_response_format() -> Value {
-    json!({
-        "type": "json_schema",
-        "json_schema": {
-            "name": "image_index",
-            "strict": true,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "description": {"type": "string", "description": "2-3 sentence description"},
-                    "filename": {"type": "string", "description": "short descriptive filename, lowercase-hyphenated, no extension"},
-                    "tags": {"type": "array", "items": {"type": "string"}, "description": "3-6 short tags"},
-                    "text_content": {"type": "string", "description": "any legible text in the image, verbatim, empty string if none"},
-                    "kind": {"type": "string", "enum": ["photo", "screenshot", "document", "diagram", "graphic", "map", "other"]},
-                },
-                "required": ["description", "filename", "tags", "text_content", "kind"],
-                "additionalProperties": false,
-            }
-        }
-    })
+fn caption_response_format() -> ResponseFormat {
+    ResponseFormat::json_schema(
+        "image_index",
+        JsonSchema::object(
+            [
+                (
+                    "description",
+                    JsonSchema::string().described("2-3 sentence description"),
+                ),
+                (
+                    "filename",
+                    JsonSchema::string().described(
+                        "short descriptive filename, lowercase-hyphenated, no extension",
+                    ),
+                ),
+                (
+                    "tags",
+                    JsonSchema::array(JsonSchema::string()).described("3-6 short tags"),
+                ),
+                (
+                    "text_content",
+                    JsonSchema::string()
+                        .described("any legible text in the image, verbatim, empty string if none"),
+                ),
+                (
+                    "kind",
+                    JsonSchema::string().one_of([
+                        "photo",
+                        "screenshot",
+                        "document",
+                        "diagram",
+                        "graphic",
+                        "map",
+                        "other",
+                    ]),
+                ),
+            ],
+            ["description", "filename", "tags", "text_content", "kind"],
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -545,6 +536,7 @@ mod tests {
     use super::*;
     use crate::error::Provider;
     use image::{ImageBuffer, Rgba};
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug)]
@@ -584,7 +576,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| Ok(caption_json("fallback")));
+                .expect("scripted caption response");
             next.map(|content| ChatResponse {
                 content,
                 tool_calls: Vec::new(),
@@ -650,7 +642,6 @@ mod tests {
 
         assert_eq!(outcome.report().indexed, 1);
         assert_eq!(chat.calls.load(Ordering::SeqCst), 2);
-        // The re-roll must use the terse prompt (cap-truncation defense).
         assert_eq!(chat.terse_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -675,10 +666,7 @@ mod tests {
     fn double_parse_fail_with_salvageable_description_indexes_degraded_row() {
         let dir = fixture_library(1);
         let truncated = r#"{"description": "An aerial photo of winding blue pools beside the ocean", "text_content": ". . . . . . . ."#;
-        let chat = ScriptedChat::new(vec![
-            Ok("not json".into()),
-            Ok(truncated.into()), // re-roll also fails to parse → salvage
-        ]);
+        let chat = ScriptedChat::new(vec![Ok("not json".into()), Ok(truncated.into())]);
         let outcome = run(dir.path(), &chat, &Budget::new(None, None));
 
         assert_eq!(outcome.report().indexed, 1);
@@ -715,10 +703,7 @@ mod tests {
         let outcome = run(dir.path(), &chat, &Budget::new(Some(0.009), None));
 
         assert!(matches!(outcome, IndexOutcome::Partial(_)));
-        // With the epsilon fix (F4), the f64 representation error no longer
-        // false-trips on the second reservation: spend 0.001 + projected 0.008
-        // = 0.009 which is within cap 0.009 + 1e-9. The third reservation
-        // (spend 0.002 + 0.008 = 0.010) hits the cap, so exactly 2 are indexed.
+        // Binary floating point puts the second reservation just above 0.009.
         assert_eq!(outcome.report().indexed, 2);
         assert_eq!(outcome.report().budget.hit.as_deref(), Some("dollars"));
     }
@@ -768,13 +753,10 @@ mod tests {
 
     #[test]
     fn f1_stale_file_skip_keeps_old_caption() {
-        // A stale file whose recaption is skipped (corrupt fixture) must keep
-        // its previous good caption in the store.
         let dir = tempfile::tempdir().unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let store = Store::open_at(store_dir.path()).unwrap();
 
-        // Create a good image and index it first.
         let good_path = dir.path().join("a.png");
         let img = ImageBuffer::from_pixel(2, 2, Rgba([10u8, 0, 0, 255]));
         img.save(&good_path).unwrap();
@@ -783,8 +765,7 @@ mod tests {
         store.append(&record_for(file, "original caption")).unwrap();
         store.ensure_meta(dir.path(), "m").unwrap();
 
-        // Now corrupt the file (change bytes + mtime) so normalize skips it.
-        // Sleep to ensure the mtime changes from the original walk.
+        // Ensure the mtime differs from the original walk.
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&good_path, b"\x13\x99\x00not an image\xff\x00").unwrap();
 
@@ -794,7 +775,6 @@ mod tests {
         let outcome =
             index_library(dir.path(), &store, &chat, &Budget::new(None, None), &opts).unwrap();
 
-        // The skip should not lose the old caption.
         let loaded = store.load("m").unwrap();
         let found = loaded
             .records
@@ -802,14 +782,11 @@ mod tests {
             .find(|r| r.rel_path == "a.png")
             .unwrap();
         assert_eq!(found.description, "original caption");
-        // It was skipped, not indexed.
         assert_eq!(outcome.report().indexed, 0);
     }
 
     #[test]
     fn f1_stale_file_successful_recaption_new_record_wins() {
-        // A stale file that gets successfully recaptioned should have the new
-        // caption replace the old one.
         let dir = tempfile::tempdir().unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let store = Store::open_at(store_dir.path()).unwrap();
@@ -822,7 +799,7 @@ mod tests {
         store.append(&record_for(file, "old caption")).unwrap();
         store.ensure_meta(dir.path(), "m").unwrap();
 
-        // Touch the file to make it stale (sleep ensures mtime differs).
+        // Ensure the mtime differs from the original walk.
         std::thread::sleep(std::time::Duration::from_millis(20));
         let img2 = ImageBuffer::from_pixel(2, 2, Rgba([20u8, 0, 0, 255]));
         img2.save(&good_path).unwrap();
@@ -844,18 +821,14 @@ mod tests {
 
     #[test]
     fn f2_stale_all_prunes_vanished_files() {
-        // When the whole index is stale (model mismatch), files that were
-        // deleted from the library should still be pruned, not kept.
         let dir = tempfile::tempdir().unwrap();
         let store_dir = tempfile::tempdir().unwrap();
         let store = Store::open_at(store_dir.path()).unwrap();
 
-        // Create one file on disk.
         let keep_path = dir.path().join("keep.png");
         let img = ImageBuffer::from_pixel(2, 2, Rgba([10u8, 0, 0, 255]));
         img.save(&keep_path).unwrap();
 
-        // Store has a record for a file that no longer exists (vanished).
         let vanished_record = IndexRecord {
             rel_path: "gone.png".to_string(),
             size: 100,
@@ -867,7 +840,6 @@ mod tests {
             kind: "photo".to_string(),
         };
         store.append(&vanished_record).unwrap();
-        // Use a different model to trigger stale_all.
         store.ensure_meta(dir.path(), "old-model").unwrap();
 
         let chat = ScriptedChat::new(vec![Ok(caption_json("keep"))]);
@@ -876,7 +848,6 @@ mod tests {
         let outcome =
             index_library(dir.path(), &store, &chat, &Budget::new(None, None), &opts).unwrap();
 
-        // The vanished file should be pruned.
         assert_eq!(outcome.report().vanished, 1);
         assert_eq!(outcome.report().pruned, 1);
         let loaded = store.load("new-model").unwrap();

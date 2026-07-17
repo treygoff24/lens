@@ -35,7 +35,10 @@ impl Budget {
     /// outstanding reservations are counted before launch, and dropped or
     /// settled reservations release their projected cost.
     pub fn may_launch(&self, spend: &Spend, projected_unit_cost: f64) -> bool {
-        self.fits(spend, projected_unit_cost)
+        if self.hit.get().is_some() {
+            return false;
+        }
+        self.fits(spend, projected_unit_cost, *self.outstanding())
     }
 
     /// Records a pre-launch reservation if actual spend plus outstanding
@@ -50,18 +53,7 @@ impl Budget {
         }
 
         let mut outstanding = self.outstanding();
-        if self.max_dollars.is_some_and(|cap| {
-            spend.total_dollars() + *outstanding + projected_unit_cost > cap + 1e-9
-        }) {
-            let _ = self.hit.set("dollars");
-            return None;
-        }
-
-        if self
-            .max_seconds
-            .is_some_and(|cap| self.start.elapsed() > Duration::from_secs(cap))
-        {
-            let _ = self.hit.set("seconds");
+        if !self.fits(spend, projected_unit_cost, *outstanding) {
             return None;
         }
 
@@ -77,13 +69,9 @@ impl Budget {
         self.hit.get().copied()
     }
 
-    fn fits(&self, spend: &Spend, projected_unit_cost: f64) -> bool {
-        if self.hit.get().is_some() {
-            return false;
-        }
-
+    fn fits(&self, spend: &Spend, projected_unit_cost: f64, outstanding: f64) -> bool {
         if self.max_dollars.is_some_and(|cap| {
-            spend.total_dollars() + *self.outstanding() + projected_unit_cost > cap + 1e-9
+            spend.total_dollars() + outstanding + projected_unit_cost > cap + 1e-9
         }) {
             let _ = self.hit.set("dollars");
             return false;
@@ -101,9 +89,7 @@ impl Budget {
     }
 
     fn outstanding(&self) -> MutexGuard<'_, f64> {
-        self.outstanding_dollars
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.outstanding_dollars.lock().unwrap()
     }
 
     fn release(&self, dollars: f64) {
@@ -226,9 +212,7 @@ mod tests {
 
     #[test]
     fn f4_epsilon_boundary_allows_exact_fit() {
-        // Pins the f64 epsilon fix: 0.001 + 0 + 0.008 == 0.009 in exact math,
-        // but f64 representation makes 0.001 + 0.008 > 0.009 true without the
-        // epsilon. With the 1e-9 tolerance, this must be allowed.
+        // Binary floating point puts 0.001 + 0.008 just above the exact cap.
         let budget = Budget::new(Some(0.009), None);
         let spend = Spend {
             dollars: 0.001,

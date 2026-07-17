@@ -64,8 +64,6 @@ fn error_schema() -> Value {
 mod tests {
     use super::*;
 
-    // F13: verify the find data variant in the response schema includes all
-    // the required property names.
     #[test]
     fn find_data_variant_has_required_properties() {
         let schema = response_schema();
@@ -85,7 +83,6 @@ mod tests {
             .get("properties")
             .expect("find data variant must have properties");
 
-        // Core fields.
         assert!(props.get("query").is_some());
         assert!(props.get("hits").is_some());
         assert!(props.get("searched").is_some());
@@ -94,7 +91,6 @@ mod tests {
         assert!(props.get("warnings").is_some());
         assert!(props.get("galleryPath").is_some());
 
-        // F13: new fields for find variants.
         assert!(props.get("outcome").is_some(), "missing outcome");
         assert!(props.get("dryRun").is_some(), "missing dryRun");
         assert!(
@@ -109,7 +105,6 @@ mod tests {
             props.get("invalidIdsDropped").is_some(),
             "missing invalidIdsDropped"
         );
-        // F1: kindFilter (array of strings, omitted when empty).
         assert!(props.get("kindFilter").is_some(), "missing kindFilter");
     }
 }

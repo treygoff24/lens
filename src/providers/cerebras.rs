@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::error::{LensError, Provider};
 use crate::providers::{
@@ -25,9 +26,29 @@ pub struct Message {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Value>,
+    pub tool_calls: Option<Vec<MessageToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub kind: ToolType,
+    pub function: MessageToolFunction,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageToolFunction {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolType {
+    Function,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,7 +107,7 @@ impl Message {
 
     /// Assistant message carrying tool calls and no `content` (Cerebras rejects
     /// `content` alongside `tool_calls`).
-    pub fn assistant_tool_calls(tool_calls: Value) -> Self {
+    pub fn assistant_tool_calls(tool_calls: Vec<MessageToolCall>) -> Self {
         Self {
             role: "assistant".into(),
             content: None,
@@ -110,7 +131,118 @@ pub struct ChatOpts {
     pub temperature: Option<f64>,
     pub max_completion_tokens: Option<u64>,
     pub tools: Option<Value>,
-    pub response_format: Option<Value>,
+    pub response_format: Option<ResponseFormat>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    JsonObject,
+    JsonSchema { json_schema: StructuredOutput },
+}
+
+impl ResponseFormat {
+    pub fn json_schema(name: impl Into<String>, schema: JsonSchema) -> Self {
+        Self::JsonSchema {
+            json_schema: StructuredOutput {
+                name: name.into(),
+                strict: true,
+                schema,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct StructuredOutput {
+    name: String,
+    strict: bool,
+    schema: JsonSchema,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct JsonSchema {
+    #[serde(rename = "type")]
+    schema_type: JsonSchemaType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    properties: BTreeMap<String, JsonSchema>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Box<JsonSchema>>,
+    #[serde(rename = "enum", skip_serializing_if = "Vec::is_empty")]
+    enum_values: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    required: Vec<String>,
+    #[serde(
+        rename = "additionalProperties",
+        skip_serializing_if = "Option::is_none"
+    )]
+    additional_properties: Option<bool>,
+}
+
+impl JsonSchema {
+    pub fn object(
+        properties: impl IntoIterator<Item = (impl Into<String>, JsonSchema)>,
+        required: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            schema_type: JsonSchemaType::Object,
+            properties: properties
+                .into_iter()
+                .map(|(name, schema)| (name.into(), schema))
+                .collect(),
+            required: required.into_iter().map(Into::into).collect(),
+            additional_properties: Some(false),
+            ..Self::bare(JsonSchemaType::Object)
+        }
+    }
+
+    pub fn string() -> Self {
+        Self::bare(JsonSchemaType::String)
+    }
+
+    pub fn integer() -> Self {
+        Self::bare(JsonSchemaType::Integer)
+    }
+
+    pub fn array(items: JsonSchema) -> Self {
+        Self {
+            items: Some(Box::new(items)),
+            ..Self::bare(JsonSchemaType::Array)
+        }
+    }
+
+    pub fn described(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn one_of(mut self, values: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.enum_values = values.into_iter().map(Into::into).collect();
+        self
+    }
+
+    fn bare(schema_type: JsonSchemaType) -> Self {
+        Self {
+            schema_type,
+            description: None,
+            properties: BTreeMap::new(),
+            items: None,
+            enum_values: Vec::new(),
+            required: Vec::new(),
+            additional_properties: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum JsonSchemaType {
+    Object,
+    String,
+    Array,
+    Integer,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,6 +275,21 @@ pub struct CerebrasClient {
     sleep_fn: SleepFn,
 }
 
+#[derive(Serialize)]
+struct ChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [Message],
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<ResponseFormat>,
+}
+
 impl CerebrasClient {
     pub fn new(api_key: String, base_url: String, model: String) -> Self {
         Self {
@@ -172,6 +319,10 @@ impl CerebrasClient {
         Arc::clone(&self.spend)
     }
 
+    pub(crate) fn spend_snapshot(&self) -> crate::providers::Spend {
+        self.spend.lock().unwrap().clone()
+    }
+
     pub fn chat(&self, messages: &[Message], opts: ChatOpts) -> Result<ChatResponse, LensError> {
         let url = join_url(&self.base_url, "/chat/completions");
         let body = self.request_body(messages, opts);
@@ -183,34 +334,23 @@ impl CerebrasClient {
         )?;
         let mut response = parse_chat_response(&raw)?;
         response.wall_time_ms = start.elapsed().as_millis() as u64;
-        self.record_spend(&response.usage, retries)?;
+        self.record_spend(&response.usage, retries);
         Ok(response)
     }
 
-    fn request_body(&self, messages: &[Message], opts: ChatOpts) -> Value {
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-            "stream": false,
-        });
-
-        if let Some(temperature) = opts.temperature {
-            body["temperature"] = json!(temperature);
+    fn request_body<'a>(&'a self, messages: &'a [Message], opts: ChatOpts) -> ChatRequest<'a> {
+        ChatRequest {
+            model: &self.model,
+            messages,
+            stream: false,
+            temperature: opts.temperature,
+            max_completion_tokens: opts.max_completion_tokens,
+            tools: opts.tools,
+            response_format: opts.response_format,
         }
-        if let Some(max_completion_tokens) = opts.max_completion_tokens {
-            body["max_completion_tokens"] = json!(max_completion_tokens);
-        }
-        if let Some(tools) = opts.tools {
-            body["tools"] = tools;
-        }
-        if let Some(response_format) = opts.response_format {
-            body["response_format"] = response_format;
-        }
-
-        body
     }
 
-    fn post_json(&self, url: &str, body: &Value) -> Result<String, HttpFailure> {
+    fn post_json(&self, url: &str, body: &impl Serialize) -> Result<String, HttpFailure> {
         let mut response = self
             .agent
             .post(url)
@@ -225,18 +365,15 @@ impl CerebrasClient {
             .map_err(|err| HttpFailure::Transport(err.to_string()))
     }
 
-    fn record_spend(&self, usage: &TokenUsage, retries: u32) -> Result<(), LensError> {
+    fn record_spend(&self, usage: &TokenUsage, retries: u32) {
         let dollars = model_cost_dollars(&self.model, usage);
-        let mut spend = self.spend.lock().map_err(|_| {
-            LensError::upstream("spend meter lock poisoned").with_provider(Provider::Cerebras)
-        })?;
+        let mut spend = self.spend.lock().unwrap();
 
         spend.prompt_tokens += usage.prompt_tokens;
         spend.completion_tokens += usage.completion_tokens;
         spend.dollars += dollars;
         spend.call_count += 1;
         spend.retries += retries as u64;
-        Ok(())
     }
 }
 
@@ -308,17 +445,37 @@ fn parse_chat_response(raw: &str) -> Result<ChatResponse, LensError> {
             .with_retryable(false)
     })?;
 
-    let message = response
+    let message = &response
         .choices
         .first()
-        .and_then(|choice| choice.message.as_ref());
+        .ok_or_else(|| {
+            LensError::upstream("Cerebras response contained no choices")
+                .with_provider(Provider::Cerebras)
+        })?
+        .message;
+    let content = match &message.content {
+        Some(content) => content.clone(),
+        None if message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty()) =>
+        {
+            String::new()
+        }
+        None => {
+            return Err(LensError::upstream(
+                "Cerebras response contained neither content nor tool calls",
+            )
+            .with_provider(Provider::Cerebras));
+        }
+    };
 
     Ok(ChatResponse {
-        content: message.and_then(|m| m.content.clone()).unwrap_or_default(),
-        tool_calls: message.map(tool_calls).unwrap_or_default(),
+        content,
+        tool_calls: tool_calls(message),
         usage: TokenUsage {
-            prompt_tokens: response.usage.prompt_tokens.unwrap_or_default(),
-            completion_tokens: response.usage.completion_tokens.unwrap_or_default(),
+            prompt_tokens: response.usage.prompt_tokens,
+            completion_tokens: response.usage.completion_tokens,
         },
         wall_time_ms: 0,
     })
@@ -327,28 +484,25 @@ fn parse_chat_response(raw: &str) -> Result<ChatResponse, LensError> {
 fn tool_calls(message: &RawMessage) -> Vec<ToolCall> {
     message
         .tool_calls
-        .as_deref()
-        .unwrap_or_default()
         .iter()
+        .flatten()
         .map(|call| ToolCall {
-            id: call.id.clone().unwrap_or_default(),
-            function_name: call.function.name.clone().unwrap_or_default(),
-            arguments: call.function.arguments.clone().unwrap_or_default(),
+            id: call.id.clone(),
+            function_name: call.function.name.clone(),
+            arguments: call.function.arguments.clone(),
         })
         .collect()
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawChatResponse {
-    #[serde(default)]
     choices: Vec<RawChoice>,
-    #[serde(default)]
     usage: RawUsage,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawChoice {
-    message: Option<RawMessage>,
+    message: RawMessage,
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,26 +513,27 @@ struct RawMessage {
 
 #[derive(Debug, Deserialize)]
 struct RawToolCall {
-    id: Option<String>,
+    id: String,
     function: RawFunction,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawFunction {
-    name: Option<String>,
-    arguments: Option<String>,
+    name: String,
+    arguments: String,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct RawUsage {
-    prompt_tokens: Option<u64>,
-    completion_tokens: Option<u64>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::providers::Spend;
+    use serde_json::json;
     use std::sync::Mutex;
 
     #[test]
@@ -399,8 +554,7 @@ mod tests {
 
     #[test]
     fn parses_content_tool_calls_and_usage_verbatim() {
-        // The HTTP envelope is valid JSON from the server; parse_chat_response no
-        // longer runs json_repair on it, so content comes through verbatim.
+        // Repairing the already-valid HTTP envelope would corrupt escaped content.
         let raw = r#"{
             "choices": [{
                 "message": {
@@ -424,11 +578,35 @@ mod tests {
     }
 
     #[test]
+    fn rejects_incomplete_response_envelopes() {
+        for raw in [
+            r#"{"choices":[],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            r#"{"choices":[{"message":{}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+            r#"{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":1}}"#,
+        ] {
+            assert!(parse_chat_response(raw).is_err());
+        }
+    }
+
+    #[test]
+    fn accepts_tool_call_response_without_content() {
+        let raw = r#"{
+            "choices": [{"message": {"tool_calls": [{
+                "id": "call_1",
+                "function": {"name": "search", "arguments": "{}"}
+            }]}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        }"#;
+
+        let parsed = parse_chat_response(raw).unwrap();
+
+        assert!(parsed.content.is_empty());
+        assert_eq!(parsed.tool_calls[0].id, "call_1");
+    }
+
+    #[test]
     fn json_repair_on_model_content_yields_parseable_json() {
-        // json_repair is the wave-3 tool for model-emitted JSON content, not the
-        // envelope. A content string with a raw control char + bad \u must parse.
-        // The literal "\\u" is a backslash-u in the string; json_repair escapes
-        // the bad one and keeps the valid \u00E9.
+        // Repair is limited to untrusted model content; HTTP envelopes are valid JSON.
         let repaired = json_repair("{\"claim\":\"Café\u{0001} \\u broken \\u00E9\"}");
         let parsed: Value = serde_json::from_str(&repaired).unwrap();
 
@@ -437,7 +615,6 @@ mod tests {
 
     #[test]
     fn message_serializes_each_role_shape_correctly() {
-        // (a) user message emits only role + content.
         let user = serde_json::to_value(Message::user("hi")).unwrap();
         let user_obj = user.as_object().unwrap();
         assert_eq!(user_obj.len(), 2);
@@ -465,18 +642,22 @@ mod tests {
             })
         );
 
-        // (b) assistant tool_calls message emits NO "content" key.
-        let assistant = serde_json::to_value(Message::assistant_tool_calls(json!([
-            {"id": "call_1", "type": "function", "function": {"name": "search", "arguments": "{}"}}
-        ])))
-        .unwrap();
+        let assistant =
+            serde_json::to_value(Message::assistant_tool_calls(vec![MessageToolCall {
+                id: "call_1".into(),
+                kind: ToolType::Function,
+                function: MessageToolFunction {
+                    name: "search".into(),
+                    arguments: "{}".into(),
+                },
+            }]))
+            .unwrap();
         let assistant_obj = assistant.as_object().unwrap();
         assert_eq!(assistant_obj.len(), 2);
         assert_eq!(assistant["role"], "assistant");
         assert!(assistant.get("content").is_none(), "content must be absent");
         assert!(assistant["tool_calls"].is_array());
 
-        // (c) tool message emits tool_call_id.
         let tool = serde_json::to_value(Message::tool("call_1", "result body")).unwrap();
         assert_eq!(tool["role"], "tool");
         assert_eq!(tool["tool_call_id"], "call_1");
@@ -494,15 +675,13 @@ mod tests {
         )
         .with_spend(Arc::clone(&spend));
 
-        client
-            .record_spend(
-                &TokenUsage {
-                    prompt_tokens: 1_000_000,
-                    completion_tokens: 1_000_000,
-                },
-                2,
-            )
-            .unwrap();
+        client.record_spend(
+            &TokenUsage {
+                prompt_tokens: 1_000_000,
+                completion_tokens: 1_000_000,
+            },
+            2,
+        );
 
         let spend = spend.lock().unwrap();
         assert_eq!(spend.prompt_tokens, 1_000_000);
@@ -522,18 +701,15 @@ mod tests {
         )
         .with_spend(Arc::clone(&spend));
 
-        client
-            .record_spend(
-                &TokenUsage {
-                    prompt_tokens: 1_000_000,
-                    completion_tokens: 1_000_000,
-                },
-                0,
-            )
-            .unwrap();
+        client.record_spend(
+            &TokenUsage {
+                prompt_tokens: 1_000_000,
+                completion_tokens: 1_000_000,
+            },
+            0,
+        );
 
         let spend = spend.lock().unwrap();
-        // 1M * 0.35 + 1M * 0.75 = 1.10
         assert!((spend.dollars - 1.10).abs() < f64::EPSILON);
     }
 }

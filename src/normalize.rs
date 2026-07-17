@@ -56,11 +56,7 @@ pub fn normalize_image(path: &Path, extension: &str, force_reencode: bool) -> No
                 return match fs::read(path) {
                     Ok(bytes) if bytes.len() <= MAX_RAW_JPEG_BYTES => {
                         match image_dimensions(path) {
-                            Ok((width, height)) => NormalizeOutput::Normalized(Normalized {
-                                jpeg_bytes: bytes,
-                                width,
-                                height,
-                            }),
+                            Ok(dimensions) => normalized_output(bytes, dimensions),
                             Err(err) => skip(
                                 NormalizeSkipReason::CorruptImage,
                                 format!("decode failed: {err}"),
@@ -79,8 +75,7 @@ pub fn normalize_image(path: &Path, extension: &str, force_reencode: bool) -> No
     match decode_with_orientation(path) {
         Ok((image, orientation)) => encode_resized(image, orientation),
         Err(err) => normalize_with_sips(path, false).unwrap_or_else(|| {
-            // F11: a pixel-limit exceeded error (from the decode limits) is a
-            // size issue, not corruption — map it to TooLarge.
+            // Decode limits reject size, not malformed image data.
             if err.to_string().contains("Image size exceeds limit") {
                 skip(
                     NormalizeSkipReason::TooLarge,
@@ -125,7 +120,7 @@ fn decode_with_orientation(path: &Path) -> image::ImageResult<(DynamicImage, Ori
     let mut reader = ImageReader::open(path)?;
     reader.limits(limits());
     let mut decoder = reader.into_decoder()?;
-    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let orientation = decoder.orientation()?;
     let image = DynamicImage::from_decoder(decoder)?;
     Ok((image, orientation))
 }
@@ -142,27 +137,25 @@ fn encode_resized(mut image: DynamicImage, orientation: Orientation) -> Normaliz
     let resized = resize_if_needed(image);
     match encode_jpeg(&resized, 80) {
         Ok(bytes) if bytes.len() <= MAX_RAW_JPEG_BYTES => {
-            let (width, height) = resized.dimensions();
-            NormalizeOutput::Normalized(Normalized {
-                jpeg_bytes: bytes,
-                width,
-                height,
-            })
+            normalized_output(bytes, resized.dimensions())
         }
         Ok(_) => match encode_jpeg(&resized, 60) {
             Ok(bytes) if bytes.len() <= MAX_RAW_JPEG_BYTES => {
-                let (width, height) = resized.dimensions();
-                NormalizeOutput::Normalized(Normalized {
-                    jpeg_bytes: bytes,
-                    width,
-                    height,
-                })
+                normalized_output(bytes, resized.dimensions())
             }
             Ok(_) => skip(NormalizeSkipReason::TooLarge, "jpeg exceeds payload limit"),
             Err(err) => skip(NormalizeSkipReason::CorruptImage, err.to_string()),
         },
         Err(err) => skip(NormalizeSkipReason::CorruptImage, err.to_string()),
     }
+}
+
+fn normalized_output(jpeg_bytes: Vec<u8>, (width, height): (u32, u32)) -> NormalizeOutput {
+    NormalizeOutput::Normalized(Normalized {
+        jpeg_bytes,
+        width,
+        height,
+    })
 }
 
 fn resize_if_needed(image: DynamicImage) -> DynamicImage {
@@ -220,9 +213,7 @@ fn normalize_with_sips(path: &Path, missing_as_unsupported: bool) -> Option<Norm
         return None;
     }
 
-    // F9: ensure the temp file is removed on ALL exit paths after the Command
-    // runs. Read the bytes, then remove immediately — every subsequent early
-    // return works with `bytes` in memory, so no temp file is leaked.
+    // Read before parsing so every later early return can remove the temp file.
     let bytes = match fs::read(&out) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -242,11 +233,7 @@ fn normalize_with_sips(path: &Path, missing_as_unsupported: bool) -> Option<Norm
         Ok(mut reader) => {
             reader.limits(limits());
             match reader.into_dimensions() {
-                Ok((width, height)) => Some(NormalizeOutput::Normalized(Normalized {
-                    jpeg_bytes: bytes,
-                    width,
-                    height,
-                })),
+                Ok(dimensions) => Some(normalized_output(bytes, dimensions)),
                 Err(_) => None,
             }
         }
@@ -266,7 +253,7 @@ fn sips_exists() -> bool {
 fn temp_jpeg_path() -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock is after the Unix epoch")
         .as_nanos();
     std::env::temp_dir().join(format!("lens-normalize-{}-{nanos}.jpg", std::process::id()))
 }
@@ -374,21 +361,10 @@ mod tests {
 
     #[test]
     fn f11_pixel_limit_exceeded_maps_to_too_large() {
-        // An image whose dimensions exceed the decode pixel limit should be
-        // classified as TooLarge, not CorruptImage. We can't create a real
-        // 12001px image in a unit test, so we verify the error-string mapping
-        // by checking the branch directly: a decode error containing "Image
-        // size exceeds limit" produces TooLarge when sips is unavailable.
-        //
-        // This is a contract test for the F11 fix: the normalize code checks
-        // `err.to_string().contains("Image size exceeds limit")` and maps it
-        // to TooLarge. The synthetic orientation test below covers the
-        // end-to-end decode path; this test pins the classification.
         let reason = NormalizeSkipReason::TooLarge;
         assert_eq!(reason.to_string(), "too_large");
     }
 
-    /// Builds a minimal EXIF APP1 segment carrying Orientation=6 (Rotate90).
     fn build_exif_app1_orientation_6() -> Vec<u8> {
         // APP1 marker
         let mut segment = vec![0xFF, 0xE1];
@@ -416,14 +392,9 @@ mod tests {
 
     #[test]
     fn f12_exif_orientation_6_swaps_dimensions_end_to_end() {
-        // Construct a baseline JPEG of a 4x2 image, splice an EXIF APP1
-        // segment with Orientation=6 (90 CW) right after SOI, and assert
-        // that normalize_image applies the orientation and swaps the
-        // output dimensions to 2x4 (within rounding from resize).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oriented.jpg");
 
-        // Encode a 4x2 RGB image as JPEG.
         let img = ImageBuffer::from_pixel(4, 2, Rgba([200u8, 100, 50, 255]));
         let mut jpeg_bytes = Vec::new();
         {
@@ -435,7 +406,6 @@ mod tests {
                 .unwrap();
         }
 
-        // Splice the APP1 segment right after SOI (0xFF 0xD8).
         assert_eq!(&jpeg_bytes[..2], &[0xFF, 0xD8]);
         let app1 = build_exif_app1_orientation_6();
         let mut spliced = Vec::with_capacity(jpeg_bytes.len() + app1.len());
@@ -447,7 +417,6 @@ mod tests {
         let out = normalize_image(&path, "jpg", false);
         match out {
             NormalizeOutput::Normalized(normalized) => {
-                // Orientation=6 is Rotate90, which swaps W/H: 4x2 → 2x4.
                 assert_eq!(
                     (normalized.width, normalized.height),
                     (2, 4),

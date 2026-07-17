@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-pub struct MockServer {
+pub(super) struct MockServer {
     base_url: String,
     requests: Arc<AtomicUsize>,
     last_request_body: Arc<Mutex<Option<String>>>,
@@ -20,7 +20,7 @@ pub struct MockServer {
 /// the request body) to a canned `ids` response. The first matching marker
 /// wins. If no marker matches, falls through to the `find_ids` queue or
 /// `[0]`.
-pub type FindRouter = Vec<(String, Vec<i64>)>;
+type FindRouter = Vec<(String, Vec<i64>)>;
 
 #[derive(Default)]
 struct MockState {
@@ -35,11 +35,11 @@ struct MockState {
 }
 
 impl MockServer {
-    pub fn start() -> Self {
+    pub(super) fn start() -> Self {
         Self::with(vec![], vec![])
     }
 
-    pub fn with(captions: Vec<&str>, find_ids: Vec<Vec<i64>>) -> Self {
+    pub(super) fn with(captions: Vec<&str>, find_ids: Vec<Vec<i64>>) -> Self {
         Self::build(
             captions,
             VecDeque::from(find_ids),
@@ -94,17 +94,17 @@ impl MockServer {
         }
     }
 
-    pub fn base_url(&self) -> &str {
+    pub(super) fn base_url(&self) -> &str {
         &self.base_url
     }
 
-    pub fn request_count(&self) -> usize {
+    pub(super) fn request_count(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
     }
 
     /// Returns the raw body of the most recent request received by the mock,
     /// or `None` if no request has been received yet.
-    pub fn last_request_body(&self) -> Option<String> {
+    pub(super) fn last_request_body(&self) -> Option<String> {
         self.last_request_body.lock().unwrap().clone()
     }
 }
@@ -127,9 +127,7 @@ fn handle_client(
     let Ok((path, body, headers)) = read_request(&mut stream) else {
         return;
     };
-    if let Ok(mut guard) = last_request_body.lock() {
-        *guard = Some(body.clone());
-    }
+    *last_request_body.lock().unwrap() = Some(body.clone());
     if headers
         .lines()
         .any(|line| line.eq_ignore_ascii_case("authorization: bearer bad-cerebras"))
@@ -192,7 +190,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String, Stri
 }
 
 fn chat_response(body: &str, state: &MockState) -> (u16, Value) {
-    let body: Value = serde_json::from_str(body).unwrap_or_else(|_| json!({}));
+    let body: Value = serde_json::from_str(body).expect("client request is valid JSON");
     let schema_name = body
         .pointer("/response_format/json_schema/name")
         .and_then(Value::as_str);
@@ -207,9 +205,7 @@ fn chat_response(body: &str, state: &MockState) -> (u16, Value) {
             (200, chat_content(caption_json(&description)))
         }
         Some("hits") => {
-            // F11: content-based routing. Check the raw request body for marker
-            // strings. The first matching marker determines the response ids.
-            let raw_body = serde_json::to_string(&body).unwrap_or_default();
+            let raw_body = serde_json::to_string(&body).expect("JSON value serializes");
             let router = state.find_router.lock().unwrap();
             for (marker, ids) in router.iter() {
                 if raw_body.contains(marker) {
@@ -218,12 +214,10 @@ fn chat_response(body: &str, state: &MockState) -> (u16, Value) {
             }
             drop(router);
 
-            // Check for raw canned content (for parse-failure tests).
             if let Some(raw) = state.find_raw.lock().unwrap().pop_front() {
                 return (200, chat_content(raw));
             }
 
-            // Default: pop from the find_ids queue.
             let ids = state
                 .find_ids
                 .lock()

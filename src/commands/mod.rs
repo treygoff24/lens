@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use clap::error::ErrorKind;
+use serde::Serialize;
 
 use crate::cli::{Cli, Commands, edit_distance};
 use crate::config::Config;
@@ -23,6 +24,11 @@ pub struct CommandSuccess {
     pub envelope: SuccessEnvelope,
     pub exit_code: i32,
     pub hint: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct TextData {
+    text: String,
 }
 
 pub fn run() -> i32 {
@@ -42,7 +48,12 @@ pub fn run() -> i32 {
                 } else {
                     "help"
                 };
-                let envelope = zero_envelope(command, serde_json::json!({"text": err.to_string()}));
+                let envelope = zero_envelope(
+                    command,
+                    TextData {
+                        text: err.to_string(),
+                    },
+                );
                 emit_success(&envelope, true);
                 return 0;
             }
@@ -103,8 +114,7 @@ fn emit_parse_error(raw_args: &[std::ffi::OsString], err: clap::Error) -> i32 {
     let lens_err =
         LensError::usage(format!("usage error: {message}")).with_suggested_fix(suggested_fix);
     let envelope = ErrorEnvelope::from_error(command, &lens_err, None);
-    // F1: detect --json in raw args so `lens --json --badflag` on a TTY still
-    // emits the error envelope on stderr (not the human renderer).
+    // Parsing can fail before `GlobalArgs` exists, so preserve raw JSON mode.
     let force_json = raw_args.iter().any(|arg| arg == "--json");
     emit_error(&envelope, force_json)
 }
@@ -206,10 +216,10 @@ fn best_match<'a>(needle: &str, choices: &'a [&'a str]) -> Option<&'a str> {
         .map(|(choice, _)| choice)
 }
 
-pub(crate) fn zero_envelope(command: &str, data: serde_json::Value) -> SuccessEnvelope {
+pub(crate) fn zero_envelope(command: &str, data: impl Serialize) -> SuccessEnvelope {
     SuccessEnvelope::new(
         command,
-        data,
+        serde_json::to_value(data).expect("command data serializes"),
         CostDollars {
             model: 0.0,
             search: 0.0,
@@ -225,26 +235,18 @@ pub(crate) fn zero_envelope(command: &str, data: serde_json::Value) -> SuccessEn
     )
 }
 
-pub(crate) fn cost_from_spend(
-    spend: &SharedSpend,
-    estimated: bool,
-) -> Result<CostDollars, LensError> {
-    let spend = spend
-        .lock()
-        .map_err(|_| LensError::upstream("spend meter lock poisoned"))?;
-    Ok(CostDollars {
+pub(crate) fn cost_from_spend(spend: &SharedSpend, estimated: bool) -> CostDollars {
+    let spend = spend.lock().unwrap();
+    CostDollars {
         model: spend.dollars,
         search: 0.0,
         total: spend.total_dollars(),
         estimated,
-    })
+    }
 }
 
-pub(crate) fn retries_from_spend(spend: &SharedSpend) -> Result<u32, LensError> {
-    let spend = spend
-        .lock()
-        .map_err(|_| LensError::upstream("spend meter lock poisoned"))?;
-    Ok(spend.retries.min(u32::MAX as u64) as u32)
+pub(crate) fn retries_from_spend(spend: &SharedSpend) -> u32 {
+    spend.lock().unwrap().retries.min(u32::MAX as u64) as u32
 }
 
 pub(crate) fn require_key(key: Option<&str>) -> Result<String, LensError> {
@@ -293,10 +295,7 @@ mod tests {
 
     #[test]
     fn emit_parse_error_detects_json_flag_in_raw_args() {
-        // F1: `lens --json --badflag` should forward force_json=true to
-        // emit_error so the error envelope is emitted on stderr even on a TTY.
-        // We can't easily test the full emit_parse_error (it writes to stderr),
-        // but we can verify the --json detection logic that feeds force_json.
+        // The stderr writer is not injectable, so pin the raw-argument seam.
         let args_with_json: Vec<OsString> =
             vec!["lens".into(), "--json".into(), "--badflag".into()];
         let force_json = args_with_json.iter().any(|arg| arg == "--json");

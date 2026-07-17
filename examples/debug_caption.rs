@@ -5,7 +5,18 @@ use lens::indexer::CaptionChat;
 use lens::normalize::{NormalizeOutput, normalize_image};
 use lens::providers::cerebras::{CerebrasClient, json_repair};
 use lens::providers::new_spend;
+use serde::Deserialize;
 use std::path::Path;
+
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct CaptionPayload {
+    description: String,
+    filename: String,
+    tags: Vec<String>,
+    text_content: String,
+    kind: String,
+}
 
 fn main() {
     let path = std::env::args()
@@ -14,7 +25,7 @@ fn main() {
     let ext = Path::new(&path)
         .extension()
         .and_then(|e| e.to_str())
-        .unwrap_or_default()
+        .expect("image path has a UTF-8 extension")
         .to_string();
     let normalized = match normalize_image(Path::new(&path), &ext, false) {
         NormalizeOutput::Normalized(n) => n,
@@ -40,7 +51,7 @@ fn main() {
         match client.caption_chat(&normalized.jpeg_bytes, attempt > 1) {
             Ok(resp) => {
                 let repaired = json_repair(&resp.content);
-                let parsed: Result<serde_json::Value, _> = serde_json::from_str(&repaired);
+                let parsed: Result<CaptionPayload, _> = serde_json::from_str(&repaired);
                 eprintln!(
                     "attempt {attempt}: len {} | parse {:?}",
                     resp.content.len(),

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde_json::{json, to_value};
+use serde::Serialize;
+use serde_json::to_value;
 
 use crate::budget::Budget as RunBudget;
 use crate::cli::{GlobalArgs, IndexArgs};
@@ -12,9 +13,36 @@ use crate::commands::{
 use crate::config::Config;
 use crate::envelope::{Budget, Diagnostics, SuccessEnvelope};
 use crate::error::LensError;
-use crate::indexer::{CAPTION_WORST_CASE_COST, IndexOptions, IndexOutcome, index_library};
+use crate::indexer::{
+    CAPTION_WORST_CASE_COST, IndexOptions, IndexOutcome, IndexReport, index_library,
+};
 use crate::providers::cerebras::CerebrasClient;
 use crate::walk::{partition_freshness, walk_library};
+
+#[derive(Serialize)]
+struct IndexData<'a> {
+    #[serde(flatten)]
+    report: &'a IndexReport,
+    outcome: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IndexDryRunData {
+    library_path: String,
+    index_path: String,
+    outcome: &'static str,
+    dry_run: bool,
+    planned_work: usize,
+    indexed: usize,
+    fresh: usize,
+    stale: usize,
+    new: usize,
+    vanished: usize,
+    stale_all: bool,
+    projected_worst_case_cost: f64,
+    projected_wall_seconds: f64,
+}
 
 pub fn run(global: &GlobalArgs, args: &IndexArgs) -> Result<CommandSuccess, LensError> {
     let started = Instant::now();
@@ -37,19 +65,20 @@ pub fn run(global: &GlobalArgs, args: &IndexArgs) -> Result<CommandSuccess, Lens
 
     let outcome = index_library(&library_path, &store, &chat, &budget, &options)?;
     let report = outcome.report();
-    // F2+F3: in human mode, print warnings to stderr. In JSON mode they ride
-    // the envelope.
     if !global.json {
         for warning in &report.warnings {
             eprintln!("warning: {warning}");
         }
     }
-    let mut data = to_value(report)
-        .map_err(|err| LensError::upstream(format!("failed to serialize index report: {err}")))?;
-    data["outcome"] = json!(match outcome {
+    let outcome_name = match outcome {
         IndexOutcome::Complete(_) => "complete",
         IndexOutcome::Partial(_) => "partial",
-    });
+    };
+    let data = to_value(IndexData {
+        report,
+        outcome: outcome_name,
+    })
+    .map_err(|err| LensError::upstream(format!("failed to serialize index report: {err}")))?;
     let exit_code = if matches!(outcome, IndexOutcome::Partial(_)) {
         10
     } else {
@@ -58,13 +87,13 @@ pub fn run(global: &GlobalArgs, args: &IndexArgs) -> Result<CommandSuccess, Lens
     let envelope = SuccessEnvelope::new(
         "index",
         data,
-        cost_from_spend(&spend, false)?,
+        cost_from_spend(&spend, false),
         Budget {
             hit: budget.hit().map(str::to_string),
         },
         Diagnostics {
             duration_ms: started.elapsed().as_millis() as u64,
-            retries: retries_from_spend(&spend)?,
+            retries: retries_from_spend(&spend),
         },
         None,
     );
@@ -85,29 +114,26 @@ fn dry_run(
     let loaded = store.load(model)?;
     let mut freshness = partition_freshness(&walked, &loaded.records);
     if loaded.stale_all {
-        let mut recaption = std::mem::take(&mut freshness.fresh);
-        recaption.append(&mut freshness.new);
-        freshness.stale.extend(recaption);
-        freshness.new = Vec::new();
-        freshness.fresh = Vec::new();
+        freshness.mark_all_stale();
     }
     let indexable = freshness.stale.len() + freshness.new.len();
     let projected = indexable as f64 * CAPTION_WORST_CASE_COST;
-    let data = json!({
-        "libraryPath": library_path.to_string_lossy(),
-        "indexPath": store.dir().to_string_lossy(),
-        "outcome": "planned",
-        "dryRun": true,
-        "plannedWork": indexable,
-        "indexed": loaded.records.len(),
-        "fresh": freshness.fresh.len(),
-        "stale": freshness.stale.len(),
-        "new": freshness.new.len(),
-        "vanished": freshness.vanished.len(),
-        "staleAll": loaded.stale_all,
-        "projectedWorstCaseCost": projected,
-        "projectedWallSeconds": indexable as f64 / f64::from(global.concurrency) * 1.5,
-    });
+    let data = to_value(IndexDryRunData {
+        library_path: library_path.to_string_lossy().into_owned(),
+        index_path: store.dir().to_string_lossy().into_owned(),
+        outcome: "planned",
+        dry_run: true,
+        planned_work: indexable,
+        indexed: loaded.records.len(),
+        fresh: freshness.fresh.len(),
+        stale: freshness.stale.len(),
+        new: freshness.new.len(),
+        vanished: freshness.vanished.len(),
+        stale_all: loaded.stale_all,
+        projected_worst_case_cost: projected,
+        projected_wall_seconds: indexable as f64 / f64::from(global.concurrency) * 1.5,
+    })
+    .map_err(|err| LensError::upstream(format!("failed to serialize index plan: {err}")))?;
     let envelope = SuccessEnvelope::new(
         "index",
         data,

@@ -3,7 +3,8 @@ use std::fs;
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde_json::{Value, json, to_value};
+use serde::Serialize;
+use serde_json::{Value, to_value};
 
 use crate::budget::Budget as RunBudget;
 use crate::cli::{FindArgs, GlobalArgs};
@@ -12,11 +13,48 @@ use crate::commands::{
     resolve_library_path, retries_from_spend,
 };
 use crate::config::Config;
-use crate::envelope::{Budget, Diagnostics, SuccessEnvelope};
+use crate::envelope::{Budget, CostDollars, Diagnostics, SuccessEnvelope};
 use crate::error::LensError;
-use crate::find::{FindContext, FindOptions, find_with_options, plan};
+use crate::find::{FindContext, FindData, FindHit, FindOptions, find_with_options, plan};
 use crate::providers::cerebras::CerebrasClient;
 use crate::store::IndexRecord;
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FindDryRunData<'a> {
+    query: &'a str,
+    dry_run: bool,
+    searched: usize,
+    mode: String,
+    chunks: usize,
+    estimated_tokens: usize,
+    projected_cost_dollars: f64,
+    warnings: Vec<String>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    kind_filter: &'a [String],
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EmptyFindData<'a> {
+    query: &'a str,
+    hits: [FindHit; 0],
+    searched: usize,
+    mode: String,
+    chunks: usize,
+    warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'static str>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    kind_filter: &'a [String],
+}
+
+#[derive(Serialize)]
+struct AnsweredFindData {
+    #[serde(flatten)]
+    data: FindData,
+    outcome: &'static str,
+}
 
 pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensError> {
     let started = Instant::now();
@@ -52,17 +90,17 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
         if let Some(warning) = zero_kind_warning.clone() {
             warnings.push(warning);
         }
-        let mut data = json!({
-            "query": args.query,
-            "dryRun": true,
-            "searched": plan.searched,
-            "mode": plan.mode,
-            "chunks": plan.chunks,
-            "estimatedTokens": plan.estimated_tokens,
-            "projectedCostDollars": plan.projected_cost_dollars,
-            "warnings": warnings,
-        });
-        add_kind_filter(&mut data, &kind_filter);
+        let data = response_value(FindDryRunData {
+            query: &args.query,
+            dry_run: true,
+            searched: plan.searched,
+            mode: plan.mode,
+            chunks: plan.chunks,
+            estimated_tokens: plan.estimated_tokens,
+            projected_cost_dollars: plan.projected_cost_dollars,
+            warnings,
+            kind_filter: &kind_filter,
+        })?;
         let envelope = SuccessEnvelope::new(
             "find",
             data,
@@ -87,86 +125,53 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
     }
 
     if unfiltered_count == 0 {
-        let data = json!({
-            "query": args.query,
-            "hits": [],
-            "searched": 0,
-            "mode": "single_shot",
-            "chunks": 0,
-            "warnings": ["index is empty; run lens index"]
-        });
-        let envelope = SuccessEnvelope::new(
-            "find",
-            data,
-            crate::envelope::CostDollars {
-                model: 0.0,
-                search: 0.0,
-                total: 0.0,
-                estimated: false,
+        return zero_cost_success(
+            EmptyFindData {
+                query: &args.query,
+                hits: [],
+                searched: 0,
+                mode: "single_shot".into(),
+                chunks: 0,
+                warnings: vec!["index is empty; run lens index".into()],
+                outcome: None,
+                kind_filter: &[],
             },
-            Budget { hit: None },
-            Diagnostics {
-                duration_ms: started.elapsed().as_millis() as u64,
-                retries: 0,
-            },
-            None,
+            &started,
+            "run `lens index --json` before searching this library",
         );
-        return Ok(CommandSuccess {
-            envelope,
-            exit_code: 0,
-            hint: Some("run `lens index --json` before searching this library"),
-        });
     }
 
     if let Some(warning) = zero_kind_warning {
         let mut warnings = loaded.warnings;
         warnings.push(warning);
-        let mut data = json!({
-            "query": args.query,
-            "hits": [],
-            "searched": 0,
-            "mode": "single_shot",
-            "chunks": 0,
-            "warnings": warnings,
-            "outcome": "answered",
-        });
-        add_kind_filter(&mut data, &kind_filter);
-        let envelope = SuccessEnvelope::new(
-            "find",
-            data,
-            crate::envelope::CostDollars {
-                model: 0.0,
-                search: 0.0,
-                total: 0.0,
-                estimated: false,
+        return zero_cost_success(
+            EmptyFindData {
+                query: &args.query,
+                hits: [],
+                searched: 0,
+                mode: "single_shot".into(),
+                chunks: 0,
+                warnings,
+                outcome: Some("answered"),
+                kind_filter: &kind_filter,
             },
-            Budget { hit: None },
-            Diagnostics {
-                duration_ms: started.elapsed().as_millis() as u64,
-                retries: 0,
-            },
-            None,
+            &started,
+            "try a --kind value present in the index",
         );
-        return Ok(CommandSuccess {
-            envelope,
-            exit_code: 0,
-            hint: Some("try a --kind value present in the index"),
-        });
     }
 
     let api_key = require_key(cfg.cerebras_api_key.as_deref())?;
     let spend = new_shared_spend();
     let chat = CerebrasClient::new(api_key, cfg.api_base, model).with_spend(Arc::clone(&spend));
     let budget = RunBudget::new(global.max_dollars, global.max_seconds);
-    // F8: wire --concurrency into find. Use the global flag when set (non-
-    // default), otherwise fall back to config.
+    // The CLI default is a sentinel here; an unchanged value defers to config.
     let concurrency = if global.concurrency != 25 {
         usize::from(global.concurrency)
     } else {
         cfg.max_concurrency as usize
     };
     let options = FindOptions { concurrency };
-    let mut data = match find_with_options(
+    let data = match find_with_options(
         &args.query,
         &library_path,
         &loaded.records,
@@ -189,39 +194,36 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
                 write_gallery(path, &data)?;
                 data.gallery_path = Some(path.to_string_lossy().to_string());
             }
-            to_value(data).map_err(|err| {
-                LensError::upstream(format!("failed to serialize find data: {err}"))
+            response_value(AnsweredFindData {
+                data,
+                outcome: "answered",
             })?
         }
         Err(err) if err.exit_code() == 10 && budget.hit().is_some() => {
             let plan = plan(&args.query, &loaded.records, args.top);
-            let mut data = json!({
-                "query": args.query,
-                "outcome": "refused",
-                "hits": [],
-                "searched": loaded.records.len(),
-                "mode": plan.mode,
-                "chunks": plan.chunks,
-                "warnings": ["budget refused find call"]
-            });
-            add_kind_filter(&mut data, &kind_filter);
-            data
+            response_value(EmptyFindData {
+                query: &args.query,
+                hits: [],
+                searched: loaded.records.len(),
+                mode: plan.mode,
+                chunks: plan.chunks,
+                warnings: vec!["budget refused find call".into()],
+                outcome: Some("refused"),
+                kind_filter: &kind_filter,
+            })?
         }
         Err(err) => return Err(err),
     };
-    if data.get("outcome").is_none() {
-        data["outcome"] = json!("answered");
-    }
     let envelope = SuccessEnvelope::new(
         "find",
         data,
-        cost_from_spend(&spend, false)?,
+        cost_from_spend(&spend, false),
         Budget {
             hit: budget.hit().map(str::to_string),
         },
         Diagnostics {
             duration_ms: started.elapsed().as_millis() as u64,
-            retries: retries_from_spend(&spend)?,
+            retries: retries_from_spend(&spend),
         },
         None,
     );
@@ -233,14 +235,43 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
     })
 }
 
+fn zero_cost_success(
+    data: impl Serialize,
+    started: &Instant,
+    hint: &'static str,
+) -> Result<CommandSuccess, LensError> {
+    Ok(CommandSuccess {
+        envelope: SuccessEnvelope::new(
+            "find",
+            response_value(data)?,
+            CostDollars {
+                model: 0.0,
+                search: 0.0,
+                total: 0.0,
+                estimated: false,
+            },
+            Budget { hit: None },
+            Diagnostics {
+                duration_ms: started.elapsed().as_millis() as u64,
+                retries: 0,
+            },
+            None,
+        ),
+        exit_code: 0,
+        hint: Some(hint),
+    })
+}
+
+fn response_value(data: impl Serialize) -> Result<Value, LensError> {
+    to_value(data)
+        .map_err(|err| LensError::upstream(format!("failed to serialize find data: {err}")))
+}
+
 fn normalize_kind(kind: &str) -> String {
     kind.trim().to_lowercase()
 }
 
-/// Dedupe the kind filter list, preserving first-occurrence order (F5). The
-/// clap `parse_kind` value parser already lowercases and trims, so
-/// `--kind PHOTO,photo` arrives as `["photo","photo"]` and is reduced to
-/// `["photo"]`.
+/// Removes duplicate filters while preserving first-occurrence order.
 fn dedupe_kinds(kinds: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     kinds
@@ -264,12 +295,6 @@ fn zero_kind_warning(unfiltered_count: usize, kinds_present: &[String]) -> Strin
         "kind filter matched 0 of {unfiltered_count} records; kinds present: {}",
         kinds_present.join(",")
     )
-}
-
-fn add_kind_filter(data: &mut Value, kind_filter: &[String]) {
-    if !kind_filter.is_empty() {
-        data["kindFilter"] = json!(kind_filter);
-    }
 }
 
 fn write_gallery(path: &std::path::Path, data: &crate::find::FindData) -> Result<(), LensError> {
@@ -316,8 +341,6 @@ mod tests {
         assert_eq!(escape_html("<&>\"'"), "&lt;&amp;&gt;&quot;&#39;");
     }
 
-    // F5: duplicate kinds (after clap lowercasing) are deduped preserving
-    // first-occurrence order.
     #[test]
     fn dedupe_kinds_preserves_first_occurrence_order() {
         assert_eq!(dedupe_kinds(vec![]), Vec::<String>::new());
@@ -325,12 +348,10 @@ mod tests {
             dedupe_kinds(vec!["photo".into()]),
             vec!["photo".to_string()]
         );
-        // --kind PHOTO,photo → clap lowercases both → dedupe to one entry.
         assert_eq!(
             dedupe_kinds(vec!["photo".into(), "photo".into()]),
             vec!["photo".to_string()]
         );
-        // Order preserved, duplicates dropped.
         assert_eq!(
             dedupe_kinds(vec![
                 "photo".into(),

@@ -11,7 +11,7 @@ use crate::commands::{
 };
 use crate::config::Config;
 use crate::envelope::{Budget, Diagnostics, SuccessEnvelope};
-use crate::error::{LensError, Provider};
+use crate::error::LensError;
 use crate::providers::cerebras::{CerebrasClient, ChatOpts, Message};
 
 #[derive(Debug, Serialize)]
@@ -86,11 +86,11 @@ pub fn run(global: &GlobalArgs, args: &DoctorArgs) -> Result<CommandSuccess, Len
         to_value(report).map_err(|err| {
             LensError::upstream(format!("failed to serialize doctor report: {err}"))
         })?,
-        cost_from_spend(&spend, false)?,
+        cost_from_spend(&spend, false),
         Budget { hit: None },
         Diagnostics {
             duration_ms: started.elapsed().as_millis() as u64,
-            retries: retries_from_spend(&spend)?,
+            retries: retries_from_spend(&spend),
         },
         None,
     );
@@ -290,9 +290,4 @@ fn report(checks: Vec<DoctorCheck>) -> DoctorReport {
         checks,
         run_id: None,
     }
-}
-
-#[allow(dead_code)]
-fn _provider_marker() -> Provider {
-    Provider::Cerebras
 }

@@ -101,9 +101,8 @@ impl Store {
     ///
     /// Accepted limitations:
     /// - **mtime-based staleness:** a lock older than 30 minutes is treated as
-    ///   stale and stolen. A writer that hangs for >30 minutes (without exiting)
-    ///   can be stolen from, since there is no PID-liveness probe (that would
-    ///   require libc and is out of scope for v1).
+    ///   stale and stolen. A writer that hangs for >30 minutes can be stolen
+    ///   from because lens avoids a platform-specific PID-liveness dependency.
     /// - **no release on SIGKILL:** if the holding process is killed with
     ///   SIGKILL, the lock file is not cleaned up and the next writer must wait
     ///   out the 30-minute staleness window (or the user deletes the file, as
@@ -112,7 +111,7 @@ impl Store {
     /// Returns `(StoreLock, Option<String>)` where the `Option<String>` is a
     /// warning message (e.g. when a stale lock is stolen). In JSON mode the
     /// caller routes this into the envelope's `warnings` instead of writing to
-    /// raw stderr (F2+F3).
+    /// raw stderr.
     pub fn lock(&self) -> Result<(StoreLock, Option<String>), LensError> {
         let path = self.lock_path();
         match create_lock_file(&path) {
@@ -121,10 +120,8 @@ impl Store {
                 if lock_is_stale(&path)? {
                     let warning = format!("stealing stale index lock {}", path.display());
                     let _ = fs::remove_file(&path);
-                    // F6: a concurrent stealer that loses the race hits
-                    // AlreadyExists here. Map it to the same "index is already
-                    // locked" error with the same suggestedFix as the young-lock
-                    // path — the other stealer won legitimately.
+                    // Another stale-lock stealer may win between removal and
+                    // creation; report its valid lock like any other live lock.
                     create_lock_file(&path).map_err(|err| {
                         if err.kind() == std::io::ErrorKind::AlreadyExists {
                             lock_busy_error(&path)
@@ -143,12 +140,18 @@ impl Store {
 
     pub fn ensure_meta(&self, library_path: &Path, model: &str) -> Result<(), LensError> {
         let now = rfc3339_now();
+        let library_path = fs::canonicalize(library_path)
+            .map_err(|err| {
+                LensError::config(format!(
+                    "failed to resolve library path {}: {err}",
+                    library_path.display()
+                ))
+            })?
+            .to_string_lossy()
+            .to_string();
         if self.meta_path().exists() {
             let mut meta = self.read_meta()?;
-            meta.library_path = fs::canonicalize(library_path)
-                .unwrap_or_else(|_| library_path.to_path_buf())
-                .to_string_lossy()
-                .to_string();
+            meta.library_path = library_path;
             meta.model = model.to_string();
             meta.schema_version = SCHEMA_VERSION;
             meta.prompt_version = PROMPT_VERSION;
@@ -157,10 +160,7 @@ impl Store {
             write_json_atomic(&self.meta_path(), &meta)
         } else {
             let meta = StoreMeta {
-                library_path: fs::canonicalize(library_path)
-                    .unwrap_or_else(|_| library_path.to_path_buf())
-                    .to_string_lossy()
-                    .to_string(),
+                library_path,
                 model: model.to_string(),
                 schema_version: SCHEMA_VERSION,
                 prompt_version: PROMPT_VERSION,
@@ -234,10 +234,8 @@ impl Store {
             }
         }
 
-        // F13: dedup last-wins by rel_path so a mid-run crash that leaves
-        // duplicate JSONL rows doesn't confuse resume. Preserve last
-        // occurrence, stable order by first occurrence (same semantics as
-        // rewrite_last_wins).
+        // A crash can leave duplicate rows; last-wins matches atomic rewrites
+        // while preserving the first occurrence's position.
         let records = dedup_last_wins(records);
 
         Ok(LoadedIndex {
@@ -278,17 +276,7 @@ impl Store {
     where
         I: IntoIterator<Item = IndexRecord>,
     {
-        let mut ordered = Vec::new();
-        let mut positions: HashMap<String, usize> = HashMap::new();
-        for record in records {
-            if let Some(pos) = positions.get(&record.rel_path).copied() {
-                ordered[pos] = record;
-            } else {
-                positions.insert(record.rel_path.clone(), ordered.len());
-                ordered.push(record);
-            }
-        }
-
+        let ordered = dedup_last_wins(records);
         let tmp = self.dir.join("index.jsonl.tmp");
         let mut file = File::create(&tmp).map_err(|err| {
             LensError::config(format!("failed to create {}: {err}", tmp.display()))
@@ -301,18 +289,7 @@ impl Store {
                 LensError::config(format!("failed to write {}: {err}", tmp.display()))
             })?;
         }
-        file.flush().map_err(|err| {
-            LensError::config(format!("failed to flush {}: {err}", tmp.display()))
-        })?;
-        // F8: fsync the tmp file before rename so the data is durable on disk.
-        file.sync_all()
-            .map_err(|err| LensError::config(format!("failed to sync {}: {err}", tmp.display())))?;
-        fs::rename(&tmp, self.index_path()).map_err(|err| {
-            LensError::config(format!(
-                "failed to replace {}: {err}",
-                self.index_path().display()
-            ))
-        })?;
+        finish_atomic_write(&mut file, &tmp, &self.index_path())?;
         Ok(ordered.len())
     }
 
@@ -363,16 +340,20 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), LensErr
     let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|err| LensError::config(format!("failed to serialize metadata: {err}")))?;
-    // F8: use an explicit File so we can fsync before the atomic rename.
     let mut file = File::create(&tmp)
         .map_err(|err| LensError::config(format!("failed to create {}: {err}", tmp.display())))?;
     file.write_all(&bytes)
         .map_err(|err| LensError::config(format!("failed to write {}: {err}", tmp.display())))?;
+    finish_atomic_write(&mut file, &tmp, path)
+}
+
+fn finish_atomic_write(file: &mut File, tmp: &Path, path: &Path) -> Result<(), LensError> {
     file.flush()
         .map_err(|err| LensError::config(format!("failed to flush {}: {err}", tmp.display())))?;
+    // Sync before rename so a reported success is durable on disk.
     file.sync_all()
         .map_err(|err| LensError::config(format!("failed to sync {}: {err}", tmp.display())))?;
-    fs::rename(&tmp, path)
+    fs::rename(tmp, path)
         .map_err(|err| LensError::config(format!("failed to replace {}: {err}", path.display())))
 }
 
@@ -404,9 +385,10 @@ fn lock_busy_error(path: &Path) -> LensError {
 /// stays at the position of the first occurrence (stable order). Mirrors the
 /// semantics of `rewrite_last_wins` so a load after a mid-run crash yields the
 /// same deduplicated set.
-fn dedup_last_wins(records: Vec<IndexRecord>) -> Vec<IndexRecord> {
+fn dedup_last_wins(records: impl IntoIterator<Item = IndexRecord>) -> Vec<IndexRecord> {
+    let records = records.into_iter();
     let mut positions: HashMap<String, usize> = HashMap::new();
-    let mut ordered = Vec::with_capacity(records.len());
+    let mut ordered = Vec::with_capacity(records.size_hint().0);
     for record in records {
         if let Some(pos) = positions.get(&record.rel_path).copied() {
             ordered[pos] = record;
@@ -422,8 +404,14 @@ fn lock_is_stale(path: &Path) -> Result<bool, LensError> {
     let meta = fs::metadata(path).map_err(|err| {
         LensError::config(format!("failed to stat lock {}: {err}", path.display()))
     })?;
+    let modified = meta.modified().map_err(|err| {
+        LensError::config(format!(
+            "failed to read lock modification time {}: {err}",
+            path.display()
+        ))
+    })?;
     let age = SystemTime::now()
-        .duration_since(meta.modified().unwrap_or(SystemTime::now()))
+        .duration_since(modified)
         .unwrap_or_default();
     Ok(age > STALE_LOCK_AFTER)
 }
@@ -435,7 +423,7 @@ fn rfc3339_now() -> String {
 fn system_time_to_rfc3339(time: SystemTime) -> String {
     let secs = time
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
+        .expect("system clock is after the Unix epoch")
         .as_secs() as i64;
     let (year, month, day, hour, minute, second) = unix_to_utc(secs);
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
@@ -609,13 +597,9 @@ mod tests {
 
     #[test]
     fn f13_load_dedupes_duplicate_rel_paths_last_wins() {
-        // A mid-run crash can leave duplicate JSONL rows for the same rel_path.
-        // load() must dedup last-wins so resume sees one record with the later
-        // values, in stable order by first occurrence.
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open_at(dir.path()).unwrap();
 
-        // Hand-write an index file with a duplicate rel_path.
         let lines = format!(
             "{}\n{}\n{}\n",
             serde_json::to_string(&record("a.jpg", 1, "first")).unwrap(),
@@ -626,7 +610,6 @@ mod tests {
 
         let loaded = store.load("m").unwrap();
         assert_eq!(loaded.records.len(), 2);
-        // "a.jpg" keeps the later values but stays at first-occurrence position.
         assert_eq!(loaded.records[0].rel_path, "a.jpg");
         assert_eq!(loaded.records[0].description, "second");
         assert_eq!(loaded.records[0].size, 3);

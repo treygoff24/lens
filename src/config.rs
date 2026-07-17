@@ -121,7 +121,7 @@ mod tests {
     fn temp_dir(name: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
+            .expect("system clock is after the Unix epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("lens-test-{name}-{}-{nanos}", std::process::id()))
     }

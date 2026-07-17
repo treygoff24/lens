@@ -9,10 +9,9 @@ use crate::store::IndexRecord;
 pub struct WalkedFile {
     /// Relative path as the OS reports it, using `/` separators.
     ///
-    /// Design amendment 4 asked for NFC normalization. Pulling a Unicode table
-    /// crate only for this path key is not worth it: macOS commonly reports NFD,
-    /// but freshness compares rows against the same walker output on later runs,
-    /// so the representation is self-consistent.
+    /// Kept in the OS representation because freshness compares later output
+    /// from the same walker; NFC normalization would add a dependency without
+    /// changing that comparison.
     pub rel_path: String,
     pub abs_path: PathBuf,
     pub size: u64,
@@ -25,6 +24,13 @@ pub struct Freshness {
     pub stale: Vec<WalkedFile>,
     pub new: Vec<WalkedFile>,
     pub vanished: Vec<IndexRecord>,
+}
+
+impl Freshness {
+    pub(crate) fn mark_all_stale(&mut self) {
+        self.stale.extend(std::mem::take(&mut self.fresh));
+        self.stale.extend(std::mem::take(&mut self.new));
+    }
 }
 
 pub fn walk_library(root: impl AsRef<Path>) -> Result<Vec<WalkedFile>, LensError> {

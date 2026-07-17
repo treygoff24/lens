@@ -218,7 +218,6 @@ fn find_out_of_range_ids_warns_and_keeps_valid_hits() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["hits"].as_array().unwrap().len(), 1);
-    // F7: invalidIdsDropped is now a structured field, not a warning string.
     assert_eq!(stdout["data"]["invalidIdsDropped"], 1);
     assert!(
         stdout["data"]["warnings"]
@@ -445,7 +444,7 @@ fn capabilities_and_schema_emit_contract_envelopes() {
         stdout["data"]["exitCodes"]["10"],
         "partial/refused; stdout carries ok:true success envelope with budget.hit set"
     );
-    // F2: capabilities cost expectations reflect live-acceptance measurements.
+    // This contract value is evidence from the measured acceptance run.
     assert!(
         stdout["data"]["costExpectations"]["prototypeRun"]
             .as_str()
@@ -591,7 +590,6 @@ fn gallery_writes_escaped_html() {
     assert!(!html.contains("<script>alert"));
 }
 
-// F11a: find --dry-run → exit 0, dryRun data, zero mock hits, no API key.
 #[test]
 fn find_dry_run_reports_plan_without_api_key() {
     let server = MockServer::start();
@@ -601,7 +599,6 @@ fn find_dry_run_reports_plan_without_api_key() {
     assert_eq!(run_index(&server, &home, &xdg, &dir).status.code(), Some(0));
     let before = server.request_count();
 
-    // No CEREBRAS_API_KEY set — dry-run must not require it.
     let output = lens_cmd(&home, &xdg)
         .env("LENS_API_BASE", server.base_url())
         .arg("--json")
@@ -626,47 +623,20 @@ fn find_dry_run_reports_plan_without_api_key() {
     assert!(stdout["data"].get("chunks").is_some());
     assert!(stdout["data"].get("estimatedTokens").is_some());
     assert!(stdout["data"].get("projectedCostDollars").is_some());
-    // Zero additional mock hits (dry-run makes no provider requests).
     assert_eq!(server.request_count(), before);
 }
 
-// F11b: chunked find E2E through the mock server. Enough large-description
-// records to force chunked mode. Mock returns DISTINCT per-chunk ids (keyed
-// by which marker filename appears in the chunk prompt). Rerank returns
-// non-zero ids. Assert the hit relPaths are the exact expected records and
-// mode == "chunked". This test must fail if B1 regresses.
 #[test]
 fn chunked_find_e2e_resolves_correct_records() {
-    // We need enough records with long descriptions to force chunked mode.
-    // The mock caption returns a fixed description, so we index many small
-    // images and the descriptions will all be "mock image caption" — but that
-    // is too short. We need to use the mock to return long descriptions.
-    // Instead of indexing real images, we'll index enough to force chunking
-    // by relying on the text_content field being long in the mock response.
-    //
-    // The mock caption returns text_content: "fixture text" — too short.
-    // We need a custom approach: create a store directly with long records.
-    //
-    // Actually, the integration tests go through the full CLI, so we must
-    // index first. The mock caption's text_content is short. But the
-    // description "mock image caption" is also short. With 3 bytes/token, we
-    // need ~210K bytes of prompt to exceed 70K tokens. Each line is ~60 bytes,
-    // so we'd need ~3,500 images. That's too many for a test.
-    //
-    // Instead, we'll write index records directly to the store path, bypassing
-    // the index command, then run find.
-
     let server = MockServer::start();
     let home = temp_root("home-chunked-e2e");
     let xdg = temp_root("xdg-chunked-e2e");
     let dir = fixture_library("library-chunked-e2e", 1);
 
-    // Index 1 image to create the store structure.
+    // Let the CLI create its hashed store path before replacing the rows.
     assert_eq!(run_index(&server, &home, &xdg, &dir).status.code(), Some(0));
 
-    // Now find the store path and overwrite index.jsonl with long records.
-    // The store is under xdg/lens/libraries/<hash>/index.jsonl. We find it by
-    // listing the libraries directory (there's only one library indexed).
+    // This fixture creates exactly one hashed library directory.
     let libraries_dir = xdg.join("lens/libraries");
     let store_dir: PathBuf = std::fs::read_dir(&libraries_dir)
         .unwrap()
@@ -675,9 +645,7 @@ fn chunked_find_e2e_resolves_correct_records() {
         .expect("store directory must exist after indexing");
     let index_path = store_dir.join("index.jsonl");
 
-    // Create 300 records with long descriptions to force chunked mode (3+
-    // chunks). With the F5 description clamp (2,000 chars), each line is
-    // ~2,170 bytes → ~723 tokens. 300 lines → ~217K tokens → 3+ chunks.
+    // 300 clamped rows force at least three chunks.
     let long_desc = "large description ".repeat(300);
     let mut records_json = String::new();
     for i in 0..300 {
@@ -696,11 +664,7 @@ fn chunked_find_e2e_resolves_correct_records() {
     }
     std::fs::write(&index_path, &records_json).unwrap();
 
-    // Use the find_ids queue with --concurrency 1 so calls are sequential:
-    // chunk 0, chunk 1, chunk 2, ..., then rerank. Each per-chunk call
-    // returns a distinct non-zero id; the rerank returns non-zero ids.
-    // With 210 records at ~723 tokens/line, we get ~3 chunks. We provide
-    // responses for up to 6 chunks plus the rerank.
+    // Serial calls map queued responses deterministically to chunks, then rerank.
     drop(server);
     let server2 = MockServer::with(
         vec![],
@@ -714,13 +678,6 @@ fn chunked_find_e2e_resolves_correct_records() {
             vec![2, 0], // rerank (non-zero ids)
         ],
     );
-
-    // The key assertions for F11b/B1 regression:
-    // 1. mode == "chunked"
-    // 2. The hits' relPaths are among our chunk files
-    // 3. There are hits (the rerank returned non-zero ids that are valid)
-    // The exact relPaths depend on chunk boundaries; the unit test in
-    // find.rs covers the exact B1 positional assertion.
 
     let output = lens_cmd(&home, &xdg)
         .env("CEREBRAS_API_KEY", "fake-cerebras")
@@ -743,13 +700,11 @@ fn chunked_find_e2e_resolves_correct_records() {
     );
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["mode"], "chunked");
-    // There should be hits (rerank returned [2, 0] which are valid union ids).
     let hits = stdout["data"]["hits"].as_array().unwrap();
     assert!(
         !hits.is_empty(),
         "chunked find should return hits from non-zero rerank ids"
     );
-    // All hit relPaths must be among our chunk files.
     for hit in hits {
         let rel = hit["relPath"].as_str().unwrap();
         assert!(
@@ -757,8 +712,7 @@ fn chunked_find_e2e_resolves_correct_records() {
             "hit relPath {rel} should be a chunk file"
         );
     }
-    // Verify we made enough find calls: at least 2 chunks + 1 rerank = 3.
-    // The index was on the first server, so server2 only counts find requests.
+    // Indexing used server1, so every server2 request is a find call.
     assert!(
         server2.request_count() >= 3,
         "expected at least 3 find requests (2+ chunks + 1 rerank), got {}",
@@ -766,8 +720,6 @@ fn chunked_find_e2e_resolves_correct_records() {
     );
 }
 
-// F12: all-invalid → reroll → error. Mock returns {"ids":[999]} twice →
-// exit 5, error envelope on stderr naming out-of-range ids, empty stdout.
 #[test]
 fn all_invalid_ids_reroll_then_upstream_error() {
     let server = MockServer::with(vec![], vec![vec![999], vec![999]]);
@@ -800,8 +752,6 @@ fn all_invalid_ids_reroll_then_upstream_error() {
     );
 }
 
-// F13: schema completeness — parse `lens schema response` output and assert
-// the find data variant has the required property names.
 #[test]
 fn schema_response_find_data_has_required_fields() {
     let home = temp_root("home-schema-fields");
@@ -824,15 +774,12 @@ fn schema_response_find_data_has_required_fields() {
         .expect("find data variant must exist");
     let props = find_variant["properties"].as_object().unwrap();
 
-    // F13: all required property names.
     assert!(props.contains_key("outcome"));
     assert!(props.contains_key("dryRun"));
     assert!(props.contains_key("estimatedTokens"));
     assert!(props.contains_key("projectedCostDollars"));
     assert!(props.contains_key("invalidIdsDropped"));
-    // F1: kindFilter (array of strings, omitted when empty) must be declared.
     assert!(props.contains_key("kindFilter"));
-    // Core fields still present.
     assert!(props.contains_key("query"));
     assert!(props.contains_key("hits"));
     assert!(props.contains_key("mode"));
@@ -847,8 +794,7 @@ fn find_kind_filters_records_before_model_call() {
     let xdg = temp_root("xdg-find-kind");
     let dir = temp_root("library-find-kind");
     let index_dir = temp_root("index-find-kind");
-    // F3: use distinct, greppable description markers so the request body can
-    // be inspected to prove the kind filter excluded the graphic record.
+    // Distinct markers make pre-model filtering observable in the request body.
     write_index_records(
         &index_dir,
         &[
@@ -885,9 +831,6 @@ fn find_kind_filters_records_before_model_call() {
     assert_eq!(stdout["data"]["hits"][0]["kind"], "photo");
     assert!(server.request_count() >= 1);
 
-    // F3: inspect the actual request body the mock received — the serialized
-    // prompt must contain the photo record's description marker and must NOT
-    // contain the graphic record's description marker.
     let body = server
         .last_request_body()
         .expect("at least one request must have reached the mock");
@@ -1041,8 +984,6 @@ fn find_kind_filter_is_case_insensitive() {
     assert_eq!(stdout["data"]["hits"][0]["relPath"], "photo.png");
 }
 
-// F5: duplicate kinds (after clap lowercasing) are deduped in the echoed
-// kindFilter, preserving first-occurrence order.
 #[test]
 fn find_kind_duplicate_filters_are_deduped_in_echo() {
     let server = MockServer::with(vec![], vec![vec![0]]);
@@ -1080,15 +1021,10 @@ fn find_kind_duplicate_filters_are_deduped_in_echo() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = json_stdout(&output);
-    // --kind PHOTO,photo → clap lowercases both → dedupe to a single "photo".
     assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
     assert_eq!(stdout["data"]["searched"], 1);
 }
 
-// F4: budget-refused + --kind path. Index two kinds; run find --kind photo
-// with a cap below one call's projection. Assert exit 10, outcome refused,
-// kindFilter == ["photo"], searched equals the FILTERED count (not total),
-// and zero requests reached the mock.
 #[test]
 fn find_kind_budget_refused_echoes_filtered_count_without_model_call() {
     let server = MockServer::start();
@@ -1136,16 +1072,11 @@ fn find_kind_budget_refused_echoes_filtered_count_without_model_call() {
     assert_eq!(stdout["budget"]["hit"], "dollars");
     assert_eq!(stdout["data"]["outcome"], "refused");
     assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
-    // searched is the FILTERED count (2 photos), not the total (4).
     assert_eq!(stdout["data"]["searched"], 2);
     assert_eq!(stdout["data"]["hits"].as_array().unwrap().len(), 0);
-    // Zero requests reached the mock.
     assert_eq!(server.request_count(), before);
 }
 
-// F6: zero-match dry-run on a non-empty fixture index, with NO API key in
-// the env. Exit 0, kindFilter == ["nosuchkind"], searched == 0, warnings
-// contains the exact kind-filter-matched-zero string, zero requests.
 #[test]
 fn find_dry_run_zero_kind_match_no_api_key() {
     let server = MockServer::start();
@@ -1162,7 +1093,6 @@ fn find_dry_run_zero_kind_match_no_api_key() {
     );
     let before = server.request_count();
 
-    // No CEREBRAS_API_KEY set — dry-run must not require it.
     let output = lens_cmd(&home, &xdg)
         .arg("--json")
         .arg("--dry-run")

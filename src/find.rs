@@ -4,11 +4,12 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 
 use crate::budget::Budget;
 use crate::error::{LensError, Provider};
-use crate::providers::cerebras::{CerebrasClient, ChatOpts, ChatResponse, Message, json_repair};
+use crate::providers::cerebras::{
+    CerebrasClient, ChatOpts, ChatResponse, JsonSchema, Message, ResponseFormat, json_repair,
+};
 use crate::providers::{SharedSpend, Spend};
 use crate::store::IndexRecord;
 
@@ -26,7 +27,6 @@ const GEMMA_OUTPUT_PER_MTOK: f64 = 2.70;
 /// ≤~600 chars; this clamp defends against corrupted or hand-edited index rows
 /// that could otherwise let a single record exceed the chunk token cap.
 const DESCRIPTION_CLAMP: usize = 2_000;
-/// Maximum text_content chars in a serialized index line.
 const TEXT_CLAMP: usize = 120;
 const FIND_PROMPT_HEAD: &str = "Photo library index, one image per line as 'id| kind | filename | description | tags | text':\n\n";
 
@@ -41,8 +41,7 @@ pub struct FindData {
     pub warnings: Vec<String>,
     #[serde(rename = "kindFilter", skip_serializing_if = "Vec::is_empty")]
     pub kind_filter: Vec<String>,
-    /// Count of out-of-range ids dropped from the model's response. Serialized
-    /// as `invalidIdsDropped` and skipped when zero (F7).
+    /// Number of out-of-range model ids discarded.
     #[serde(skip_serializing_if = "is_zero")]
     pub invalid_ids_dropped: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,10 +85,7 @@ impl FindChat for CerebrasClient {
     }
 
     fn spend_snapshot(&self) -> Spend {
-        self.spend()
-            .lock()
-            .map(|spend| spend.clone())
-            .unwrap_or_default()
+        CerebrasClient::spend_snapshot(self)
     }
 }
 
@@ -111,11 +107,6 @@ pub struct FindContext<'a> {
     pub spend: &'a SharedSpend,
 }
 
-/// Tracks the number of invalid (out-of-range) ids dropped across all
-/// `call_for_ids` invocations for a single find run. This is accumulated
-/// alongside `warnings` so that `FindData` can carry the structured
-/// `invalidIdsDropped` field (F7) while `warnings` no longer carries the
-/// free-form "invalidIdsDropped: N" string.
 struct FindStats {
     invalid_ids_dropped: usize,
 }
@@ -241,9 +232,7 @@ pub fn plan(query: &str, records: &[IndexRecord], top: usize) -> FindPlan {
     }
 }
 
-/// Chunked find: per-chunk top-N → union → rerank. Returns the selected
-/// `IndexRecord`s in rank order (B1: resolves ids against the correct
-/// snapshot so no positional cross-snapshot confusion is possible).
+/// Runs per-chunk searches, unions their results, then reranks that union.
 fn chunked_ids(
     query: &str,
     snapshot: &[SnapshotRecord],
@@ -259,28 +248,19 @@ fn chunked_ids(
     )));
     let (tx, rx) = mpsc::channel();
 
-    // Thread-local stats are accumulated into the parent after the scope
-    // completes, because `stats` is not `Sync` (it lives behind a &mut).
-    // We pass the per-worker invalid-id counts through the channel alongside
-    // the results.
+    // Pass worker counts through the channel because `&mut stats` is not `Sync`.
     let collected: Vec<IndexRecord> = thread::scope(|scope| {
         for _ in 0..concurrency {
             let queue = Arc::clone(&queue);
             let tx = tx.clone();
             scope.spawn(move || {
                 loop {
-                    let Some((chunk_idx, chunk)) = queue
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .pop_front()
-                    else {
+                    let Some((chunk_idx, chunk)) = queue.lock().unwrap().pop_front() else {
                         return;
                     };
                     let mut local_stats = FindStats {
                         invalid_ids_dropped: 0,
                     };
-                    // B1: call_for_ids resolves ids against the chunk snapshot
-                    // it was called with, returning IndexRecords directly.
                     let result = call_for_ids(query, &chunk, chunk_top, ctx, &mut local_stats);
                     let _ = tx.send((chunk_idx, result, local_stats));
                 }
@@ -296,7 +276,6 @@ fn chunked_ids(
         Ok::<Vec<IndexRecord>, LensError>(collected)
     })?;
 
-    // Dedup by rel_path (first wins, preserving rank order from chunks).
     let mut seen = HashSet::new();
     let mut union = Vec::new();
     for record in collected {
@@ -305,22 +284,12 @@ fn chunked_ids(
         }
     }
     let union_snapshot = make_snapshot(&union);
-    // B1: the rerank call resolves its ids against the UNION snapshot it was
-    // called with, returning IndexRecords directly — no positional confusion
-    // with the full snapshot.
+    // Rerank ids are positions in the union, not the full index.
     call_for_ids(query, &union_snapshot, top, ctx, stats)
 }
 
-/// Makes a single find model call (with re-roll policies) and resolves the
-/// returned ids against the *same* snapshot the call was made against.
-/// Returns the selected `IndexRecord`s in rank order (B1).
-///
-/// Re-roll policies:
-/// - F6: all-invalid-id reroll — if every returned id is out of range, reserve
-///   budget for one more call and retry. Refusal → same budget-partial error.
-/// - F9: parse-failure reroll — if the JSON fails to parse on the first call,
-///   reserve budget for one more call and retry. Second failure → upstream
-///   error.
+/// Retries malformed or wholly invalid results once, then resolves ids against
+/// the same snapshot sent to the model.
 fn call_for_ids(
     query: &str,
     snapshot: &[SnapshotRecord],
@@ -331,62 +300,19 @@ fn call_for_ids(
     let prompt = prompt(query, &lines_for(snapshot), top);
     let projected = projected_call_cost(estimate_tokens(prompt.len()));
 
-    // Initial call.
-    let reservation = ctx
-        .budget
-        .reserve(&ctx.chat.spend_snapshot(), projected)
-        .ok_or_else(|| LensError::partial("budget refused find call"))?;
-    let response = ctx.chat.find_chat(
-        &[Message::user(prompt.clone())],
-        ChatOpts {
-            max_completion_tokens: Some(FIND_MAX_COMPLETION_TOKENS),
-            response_format: Some(ids_response_format()),
-            ..ChatOpts::default()
-        },
-    );
-    reservation.settle(0.0);
-    let response = response?;
+    let response = find_call(&prompt, ctx, projected)?;
 
-    // F9: parse failure gets one re-roll (budget-reserved like F6).
     let parsed = match parse_ids(&response.content) {
         Ok(payload) => payload,
         Err(parse_err) => {
-            // Reserve budget for the re-roll.
-            let reroll_reservation = ctx
-                .budget
-                .reserve(&ctx.chat.spend_snapshot(), projected)
-                .ok_or_else(|| LensError::partial("budget refused find call"))?;
-            let reroll = ctx.chat.find_chat(
-                &[Message::user(prompt.clone())],
-                ChatOpts {
-                    max_completion_tokens: Some(FIND_MAX_COMPLETION_TOKENS),
-                    response_format: Some(ids_response_format()),
-                    ..ChatOpts::default()
-                },
-            );
-            reroll_reservation.settle(0.0);
-            let reroll = reroll?;
+            let reroll = find_call(&prompt, ctx, projected)?;
             parse_ids(&reroll.content).map_err(|_| parse_err)?
         }
     };
 
     let filtered = filter_ids(&parsed.ids, snapshot.len(), stats);
     if filtered.is_empty() && !parsed.ids.is_empty() {
-        // F6: all-invalid-id reroll — reserve budget before the retry.
-        let reroll_reservation = ctx
-            .budget
-            .reserve(&ctx.chat.spend_snapshot(), projected)
-            .ok_or_else(|| LensError::partial("budget refused find call"))?;
-        let reroll = ctx.chat.find_chat(
-            &[Message::user(prompt)],
-            ChatOpts {
-                max_completion_tokens: Some(FIND_MAX_COMPLETION_TOKENS),
-                response_format: Some(ids_response_format()),
-                ..ChatOpts::default()
-            },
-        );
-        reroll_reservation.settle(0.0);
-        let reroll = reroll?;
+        let reroll = find_call(&prompt, ctx, projected)?;
         let parsed = parse_ids(&reroll.content)?;
         let filtered = filter_ids(&parsed.ids, snapshot.len(), stats);
         if filtered.is_empty() && !parsed.ids.is_empty() {
@@ -395,13 +321,32 @@ fn call_for_ids(
                     .with_provider(Provider::Cerebras),
             );
         }
-        // Resolve filtered ids to records against the same snapshot.
         return Ok(resolve_ids(&filtered, snapshot));
     }
     Ok(resolve_ids(&filtered, snapshot))
 }
 
-/// Maps validated position ids to `IndexRecord`s in rank order.
+fn find_call(
+    prompt: &str,
+    ctx: FindContext<'_>,
+    projected_cost: f64,
+) -> Result<ChatResponse, LensError> {
+    let reservation = ctx
+        .budget
+        .reserve(&ctx.chat.spend_snapshot(), projected_cost)
+        .ok_or_else(|| LensError::partial("budget refused find call"))?;
+    let response = ctx.chat.find_chat(
+        &[Message::user(prompt)],
+        ChatOpts {
+            max_completion_tokens: Some(FIND_MAX_COMPLETION_TOKENS),
+            response_format: Some(ids_response_format()),
+            ..ChatOpts::default()
+        },
+    );
+    reservation.settle(0.0);
+    response
+}
+
 fn resolve_ids(ids: &[usize], snapshot: &[SnapshotRecord]) -> Vec<IndexRecord> {
     ids.iter()
         .filter_map(|&id| snapshot.get(id).map(|item| item.record.clone()))
@@ -421,8 +366,6 @@ fn parse_ids(content: &str) -> Result<IdsPayload, LensError> {
     })
 }
 
-/// Filters raw i64 ids to valid usize positions, counting dropped ids into
-/// `stats` (F7: no longer pushes a warning string).
 fn filter_ids(ids: &[i64], len: usize, stats: &mut FindStats) -> Vec<usize> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
@@ -466,7 +409,6 @@ fn data_from_records(
             }
         })
         .collect();
-    // `searched` is always the FULL snapshot length (B1).
     FindData {
         query: query.to_string(),
         hits,
@@ -508,9 +450,6 @@ fn lines_for(records: &[SnapshotRecord]) -> Vec<String> {
 }
 
 fn line_for(id: usize, record: &IndexRecord) -> String {
-    // F5: clamp description to 2,000 chars (defense against corrupted/hand-edited
-    // index rows; normal captions are ≤~600 chars). Keep the existing 120-char
-    // text clamp.
     let description: String = record.description.chars().take(DESCRIPTION_CLAMP).collect();
     let mut line = format!(
         "{id}| {} | {} | {} | tags: {}",
@@ -553,9 +492,7 @@ fn chunk_top(top: usize) -> usize {
 }
 
 fn chunks_for(query: &str, snapshot: &[SnapshotRecord], top: usize) -> Vec<Vec<SnapshotRecord>> {
-    // F4: size with chunk_top(top), the same `top` value the per-chunk workers
-    // actually send. The old code used `top` (the final rerank top) which
-    // mis-estimated chunk sizes.
+    // Size chunks with the larger per-chunk result count used by workers.
     let ct = chunk_top(top);
     let mut chunks: Vec<Vec<SnapshotRecord>> = Vec::new();
     let mut current = Vec::new();
@@ -573,10 +510,7 @@ fn chunks_for(query: &str, snapshot: &[SnapshotRecord], top: usize) -> Vec<Vec<S
     if !current.is_empty() {
         chunks.push(current);
     }
-    // Invariant (F5): with the DESCRIPTION_CLAMP (2,000 chars) and TEXT_CLAMP
-    // (120 chars) on line_for, a single record's serialized line cannot
-    // exceed CHUNK_TOKEN_CAP. This guarantees the `else` branch above always
-    // makes progress — a single record always fits in one chunk.
+    // The clamps guarantee that one record always fits, so the loop progresses.
     debug_assert!(
         chunks.iter().all(|chunk| !chunk.is_empty()),
         "chunks must be non-empty"
@@ -584,25 +518,17 @@ fn chunks_for(query: &str, snapshot: &[SnapshotRecord], top: usize) -> Vec<Vec<S
     chunks
 }
 
-fn ids_response_format() -> Value {
-    json!({
-        "type": "json_schema",
-        "json_schema": {
-            "name": "hits",
-            "strict": true,
-            "schema": {
-                "type": "object",
-                "properties": {"ids": {"type": "array", "items": {"type": "integer"}}},
-                "required": ["ids"],
-                "additionalProperties": false
-            }
-        }
-    })
+fn ids_response_format() -> ResponseFormat {
+    ResponseFormat::json_schema(
+        "hits",
+        JsonSchema::object([("ids", JsonSchema::array(JsonSchema::integer()))], ["ids"]),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -645,7 +571,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pop_front()
-                .unwrap_or_else(|| json!({"ids":[0]}).to_string());
+                .expect("scripted find response");
             Ok(ChatResponse {
                 content,
                 tool_calls: Vec::new(),
@@ -681,7 +607,6 @@ mod tests {
 
     #[test]
     fn filter_ids_counts_dropped_into_stats() {
-        // F7: invalid ids are counted in stats, not in warnings.
         let mut stats = FindStats {
             invalid_ids_dropped: 0,
         };
@@ -692,8 +617,7 @@ mod tests {
 
     #[test]
     fn large_indexes_use_chunked_rerank_path() {
-        // With the F5 description clamp (2,000 chars), each line is ~2,170
-        // bytes → ~723 tokens. Need >97 records to exceed 70K tokens.
+        // 150 clamped records exceed the 100K estimated-token cap.
         let records = (0..150)
             .map(|i| rec(&format!("{i:03}.jpg"), &"large description ".repeat(300)))
             .collect::<Vec<_>>();
@@ -722,18 +646,10 @@ mod tests {
         assert!(chat.calls.load(Ordering::SeqCst) > plan.chunks);
     }
 
-    // B1 regression test: 3 chunks where per-chunk responses pick DISTINCT
-    // non-zero ids, and the rerank returns non-zero ids. The returned hit
-    // relPaths must be the exact union records at those union positions,
-    // computed independently in the test. The old code (all calls return [0])
-    // could not catch this because id 0 maps to the same record in both
-    // snapshots.
+    // Distinct nonzero ids expose accidental resolution against the full snapshot.
     #[test]
     fn chunked_find_resolves_rerank_ids_against_union_snapshot() {
-        // Build records large enough to force 3+ chunks.
-        // With the F5 description clamp (2,000 chars), each line is ~2,170
-        // bytes → ~723 estimated tokens. Need >277 records for 3 chunks
-        // (each ≤100K estimated tokens). Use 450 for at least 3 chunks.
+        // 450 clamped records force at least three chunks.
         let records: Vec<IndexRecord> = (0..450)
             .map(|i| {
                 rec(
@@ -747,14 +663,10 @@ mod tests {
         let num_chunks = plan.chunks;
         assert!(num_chunks >= 3, "need at least 3 chunks, got {num_chunks}");
 
-        // Build the snapshot and chunks exactly as find_with_options does, to
-        // compute the expected union records independently.
+        // Rebuild the union independently so expected values cannot share the bug.
         let snapshot = make_snapshot(&records);
         let chunks = chunks_for("large", &snapshot, 3);
 
-        // Script per-chunk responses: each chunk returns a DISTINCT non-zero id.
-        // chunk 0 → id 2, chunk 1 → id 1, chunk 2 → id 3 (if chunk has 4+ records).
-        // Remaining chunks → id 0.
         let mut scripted_responses: Vec<String> = Vec::new();
         let per_chunk_ids: Vec<usize> = (0..num_chunks)
             .map(|i| match i {
@@ -768,7 +680,6 @@ mod tests {
             scripted_responses.push(json!({"ids":[id]}).to_string());
         }
 
-        // Compute the union: collect the records selected from each chunk.
         let mut union_records: Vec<IndexRecord> = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
             let id = per_chunk_ids[i];
@@ -776,7 +687,6 @@ mod tests {
                 union_records.push(chunk[id].record.clone());
             }
         }
-        // Dedup by rel_path (first wins).
         let mut seen = HashSet::new();
         let mut union_deduped: Vec<IndexRecord> = Vec::new();
         for record in union_records {
@@ -786,12 +696,9 @@ mod tests {
         }
         let union_snapshot = make_snapshot(&union_deduped);
 
-        // The rerank call returns ids [2, 0] — non-zero id 2 is key.
-        // This maps to union_snapshot[2] and union_snapshot[0].
         let rerank_ids = vec![2, 0];
         scripted_responses.push(json!({"ids": rerank_ids}).to_string());
 
-        // Compute expected hit relPaths independently.
         let mut expected_rel_paths: Vec<String> = Vec::new();
         for &id in &rerank_ids {
             if id < union_snapshot.len() {
@@ -816,7 +723,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(data.mode, "chunked");
-        // The hits must match the expected relPaths computed from the union.
         let actual_rel_paths: Vec<String> = data.hits.iter().map(|h| h.rel_path.clone()).collect();
         assert_eq!(
             actual_rel_paths, expected_rel_paths,
@@ -824,11 +730,9 @@ mod tests {
         );
     }
 
-    // F9: parse failure on the first call gets one re-roll, then succeeds.
     #[test]
     fn parse_failure_rerolls_once_then_succeeds() {
         let records = vec![rec("a.jpg", "desc"), rec("b.jpg", "desc2")];
-        // First call returns bad JSON, second call returns valid ids.
         let chat = ScriptedFindChat::new(vec![
             "not valid json".to_string(),
             json!({"ids": [0]}).to_string(),
@@ -854,7 +758,6 @@ mod tests {
         assert_eq!(chat.calls.load(Ordering::SeqCst), 2);
     }
 
-    // F9: parse failure on both calls → upstream error.
     #[test]
     fn double_parse_failure_yields_upstream_error() {
         let records = vec![rec("a.jpg", "desc"), rec("b.jpg", "desc2")];
@@ -880,11 +783,9 @@ mod tests {
         assert_eq!(result.unwrap_err().exit_code(), 5);
     }
 
-    // F6: all-invalid ids → reroll → still all invalid → upstream error.
     #[test]
     fn all_invalid_ids_reroll_then_error() {
         let records = vec![rec("a.jpg", "desc")];
-        // Both calls return id 999 (out of range for a 1-record snapshot).
         let chat = ScriptedFindChat::new(vec![
             json!({"ids": [999]}).to_string(),
             json!({"ids": [999]}).to_string(),
@@ -907,19 +808,13 @@ mod tests {
         assert_eq!(result.unwrap_err().exit_code(), 5);
     }
 
-    // F5: description is clamped to 2,000 chars.
     #[test]
     fn description_is_clamped_to_2000_chars() {
         let long_desc = "x".repeat(5_000);
         let record = rec("a.jpg", &long_desc);
         let line = line_for(0, &record);
-        // The description portion should be clamped, not the full 5,000 chars.
-        // The line format is "0| photo | a-jpg | <desc> | tags: tag | text: ..."
-        // We just verify the line doesn't contain the full 5,000-char description.
         assert!(!line.contains(&"x".repeat(5_000)));
-        // And it does contain at least 2,000 x's (the clamp limit).
         let x_count = line.matches('x').count();
-        // 2000 from description + 156 from text_content (6*26=156) = 2156
         assert!(
             x_count >= 2_000,
             "description should have at least 2000 chars, got {x_count}"
@@ -930,11 +825,9 @@ mod tests {
         );
     }
 
-    // F7: invalidIdsDropped is a structured field, not a warning string.
     #[test]
     fn invalid_ids_dropped_is_structured_field_not_warning() {
         let records = vec![rec("a.jpg", "desc"), rec("b.jpg", "desc2")];
-        // Return [99, 0] — 99 is out of range, 0 is valid.
         let chat = ScriptedFindChat::new(vec![json!({"ids": [99, 0]}).to_string()]);
         let spend = crate::providers::new_spend();
         let data = find_with_options(
@@ -952,7 +845,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(data.invalid_ids_dropped, 1);
-        // The warnings should NOT contain the old "invalidIdsDropped: 1" string.
         assert!(
             !data
                 .warnings
@@ -960,7 +852,4 @@ mod tests {
                 .any(|w| w.contains("invalidIdsDropped"))
         );
     }
-
-    // F10: settle_spend_seen is gone — verify no lock-and-drop no-op.
-    // This is implicitly tested by the fact that the code compiles without it.
 }
