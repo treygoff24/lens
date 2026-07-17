@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{LensError, Provider};
@@ -178,7 +179,7 @@ enum JsonSchemaType {
     Integer,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct TokenUsage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -334,6 +335,10 @@ pub fn json_repair(s: &str) -> String {
     }
 
     out
+}
+
+pub(crate) fn parse_repaired_json<T: DeserializeOwned>(s: &str) -> serde_json::Result<T> {
+    serde_json::from_str(&json_repair(s))
 }
 
 fn is_stripped_control(ch: char) -> bool {

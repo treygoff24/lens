@@ -79,12 +79,7 @@ pub(crate) fn zero_envelope(command: &str, data: impl Serialize) -> SuccessEnvel
     SuccessEnvelope::new(
         command,
         serde_json::to_value(data).expect("command data serializes"),
-        CostDollars {
-            model: 0.0,
-            search: 0.0,
-            total: 0.0,
-            estimated: false,
-        },
+        zero_cost(),
         Budget { hit: None },
         Diagnostics {
             duration_ms: 0,
@@ -158,12 +153,7 @@ pub(crate) fn zero_cost_success(
         envelope: SuccessEnvelope::new(
             command,
             response_value(&format!("{command} data"), data)?,
-            CostDollars {
-                model: 0.0,
-                search: 0.0,
-                total: 0.0,
-                estimated: false,
-            },
+            zero_cost(),
             Budget { hit: None },
             Diagnostics {
                 duration_ms: started.elapsed().as_millis() as u64,
@@ -174,6 +164,15 @@ pub(crate) fn zero_cost_success(
         exit_code: 0,
         hint: Some(hint),
     })
+}
+
+fn zero_cost() -> CostDollars {
+    CostDollars {
+        model: 0.0,
+        search: 0.0,
+        total: 0.0,
+        estimated: false,
+    }
 }
 
 fn cost_from_spend(spend: &SharedSpend) -> CostDollars {

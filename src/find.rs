@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use crate::budget::Budget;
 use crate::error::{LensError, Provider};
 use crate::providers::cerebras::{
-    CerebrasClient, ChatOpts, ChatResponse, JsonSchema, Message, ResponseFormat, json_repair,
+    CerebrasClient, ChatOpts, ChatResponse, JsonSchema, Message, ResponseFormat,
+    parse_repaired_json,
 };
 use crate::providers::{SharedSpend, Spend};
 use crate::store::IndexRecord;
@@ -108,28 +109,6 @@ pub struct FindContext<'a> {
 
 struct FindStats {
     invalid_ids_dropped: usize,
-}
-
-pub fn find(
-    query: &str,
-    records: &[IndexRecord],
-    top: usize,
-    chat: &(dyn FindChat + Sync),
-    budget: &Budget,
-    spend: &SharedSpend,
-) -> Result<FindData, LensError> {
-    find_with_options(
-        query,
-        Path::new(""),
-        records,
-        top,
-        FindContext {
-            chat,
-            budget,
-            spend,
-        },
-        &FindOptions::default(),
-    )
 }
 
 pub fn find_with_options(
@@ -350,13 +329,13 @@ fn resolve_ids(ids: &[usize], snapshot: &[SnapshotRecord]) -> Vec<IndexRecord> {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-struct IdsPayload {
-    ids: Vec<i64>,
+#[doc(hidden)]
+pub struct IdsPayload {
+    pub ids: Vec<i64>,
 }
 
 fn parse_ids(content: &str) -> Result<IdsPayload, LensError> {
-    let repaired = json_repair(content);
-    serde_json::from_str(&repaired).map_err(|err| {
+    parse_repaired_json(content).map_err(|err| {
         LensError::upstream(format!("failed to parse find response JSON: {err}"))
             .with_provider(Provider::Cerebras)
     })

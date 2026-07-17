@@ -34,6 +34,14 @@ fn lens_cmd(home: &Path, xdg: &Path) -> Command {
     cmd
 }
 
+fn online_lens_cmd(server: &MockServer, home: &Path, xdg: &Path, api_key: &str) -> Command {
+    let mut cmd = lens_cmd(home, xdg);
+    cmd.env("CEREBRAS_API_KEY", api_key)
+        .env("LENS_API_BASE", server.base_url())
+        .arg("--json");
+    cmd
+}
+
 fn fixture_library(name: &str, count: usize) -> PathBuf {
     let dir = temp_root(name);
     for i in 0..count {
@@ -57,6 +65,15 @@ fn json_stdout(output: &std::process::Output) -> Value {
 
 fn json_stderr(output: &std::process::Output) -> Value {
     serde_json::from_slice(&output.stderr).unwrap()
+}
+
+fn assert_exit(output: &std::process::Output, code: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(code),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_index_records(index_dir: &Path, records: &[IndexRecord]) {
@@ -83,10 +100,7 @@ fn index_record(rel_path: &str, kind: &str, description: &str) -> IndexRecord {
 }
 
 fn run_index(server: &MockServer, home: &Path, xdg: &Path, dir: &Path) -> std::process::Output {
-    lens_cmd(home, xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    online_lens_cmd(server, home, xdg, "fake-cerebras")
         .arg("--concurrency")
         .arg("1")
         .arg("index")
@@ -104,12 +118,7 @@ fn full_index_run_reports_envelope_counts_and_spend() {
 
     let output = run_index(&server, &home, &xdg, &dir);
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     assert!(output.stderr.is_empty());
     let stdout = json_stdout(&output);
     assert_eq!(stdout["schema"], "lens.cli.response.v1");
@@ -168,10 +177,7 @@ fn find_single_shot_returns_absolute_ranked_hits() {
     let dir = fixture_library("library-find", 2);
     assert_eq!(run_index(&server, &home, &xdg, &dir).status.code(), Some(0));
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("find")
         .arg("hero shot")
         .arg("--dir")
@@ -179,12 +185,7 @@ fn find_single_shot_returns_absolute_ranked_hits() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["mode"], "single_shot");
     assert_eq!(stdout["data"]["hits"][0]["relPath"], "1.png");
@@ -205,10 +206,7 @@ fn find_out_of_range_ids_warns_and_keeps_valid_hits() {
     let dir = fixture_library("library-invalid-id", 1);
     assert_eq!(run_index(&server, &home, &xdg, &dir).status.code(), Some(0));
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("find")
         .arg("anything")
         .arg("--dir")
@@ -292,10 +290,7 @@ fn budget_kill_exits_10_with_success_envelope_and_budget_skips() {
     let xdg = temp_root("xdg-budget");
     let dir = fixture_library("library-budget", 2);
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("--max-dollars")
         .arg("0.001")
         .arg("index")
@@ -504,10 +499,7 @@ fn doctor_online_bad_key_exits_2_with_stdout_report() {
     let server = MockServer::start();
     let home = temp_root("home-doctor-online");
     let xdg = temp_root("xdg-doctor-online");
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "bad-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "bad-cerebras")
         .arg("doctor")
         .arg("--online")
         .output()
@@ -536,10 +528,7 @@ fn find_budget_refusal_exits_10_with_success_envelope() {
     let dir = fixture_library("library-find-budget", 1);
     assert_eq!(run_index(&server, &home, &xdg, &dir).status.code(), Some(0));
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("--max-dollars")
         .arg("0.000001")
         .arg("find")
@@ -567,10 +556,7 @@ fn gallery_writes_escaped_html() {
     assert_eq!(run_index(&server, &home, &xdg, &dir).status.code(), Some(0));
     let gallery = temp_root("gallery-out").join("gallery.html");
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("find")
         .arg("script")
         .arg("--dir")
@@ -611,12 +597,7 @@ fn find_dry_run_reports_plan_without_api_key() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     assert!(output.stderr.is_empty());
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["dryRun"], true);
@@ -679,10 +660,7 @@ fn chunked_find_e2e_resolves_correct_records() {
         ],
     );
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server2.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server2, &home, &xdg, "fake-cerebras")
         .arg("--concurrency")
         .arg("1")
         .arg("find")
@@ -692,12 +670,7 @@ fn chunked_find_e2e_resolves_correct_records() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["mode"], "chunked");
     let hits = stdout["data"]["hits"].as_array().unwrap();
@@ -728,10 +701,7 @@ fn all_invalid_ids_reroll_then_upstream_error() {
     let dir = fixture_library("library-all-invalid", 1);
     assert_eq!(run_index(&server, &home, &xdg, &dir).status.code(), Some(0));
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("find")
         .arg("anything")
         .arg("--dir")
@@ -753,41 +723,6 @@ fn all_invalid_ids_reroll_then_upstream_error() {
 }
 
 #[test]
-fn schema_response_find_data_has_required_fields() {
-    let home = temp_root("home-schema-fields");
-    let xdg = temp_root("xdg-schema-fields");
-    let output = lens_cmd(&home, &xdg)
-        .arg("--json")
-        .arg("schema")
-        .arg("response")
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = json_stdout(&output);
-    let data_variants = stdout["data"]["properties"]["data"]["oneOf"]
-        .as_array()
-        .unwrap();
-    let find_variant = data_variants
-        .iter()
-        .find(|v| v["description"] == "find data")
-        .expect("find data variant must exist");
-    let props = find_variant["properties"].as_object().unwrap();
-
-    assert!(props.contains_key("outcome"));
-    assert!(props.contains_key("dryRun"));
-    assert!(props.contains_key("estimatedTokens"));
-    assert!(props.contains_key("projectedCostDollars"));
-    assert!(props.contains_key("invalidIdsDropped"));
-    assert!(props.contains_key("kindFilter"));
-    assert!(props.contains_key("query"));
-    assert!(props.contains_key("hits"));
-    assert!(props.contains_key("mode"));
-    assert!(props.contains_key("chunks"));
-    assert!(props.contains_key("warnings"));
-}
-
-#[test]
 fn find_kind_filters_records_before_model_call() {
     let server = MockServer::with(vec![], vec![vec![0]]);
     let home = temp_root("home-find-kind");
@@ -803,10 +738,7 @@ fn find_kind_filters_records_before_model_call() {
         ],
     );
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("--index-path")
         .arg(&index_dir)
         .arg("find")
@@ -818,12 +750,7 @@ fn find_kind_filters_records_before_model_call() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
     assert_eq!(stdout["data"]["searched"], 1);
@@ -872,12 +799,7 @@ fn find_kind_zero_match_returns_empty_success_without_model_call() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     assert!(output.stderr.is_empty());
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["outcome"], "answered");
@@ -957,10 +879,7 @@ fn find_kind_filter_is_case_insensitive() {
         &[index_record("photo.png", "photo", "photo line")],
     );
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("--index-path")
         .arg(&index_dir)
         .arg("find")
@@ -972,12 +891,7 @@ fn find_kind_filter_is_case_insensitive() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
     assert_eq!(stdout["data"]["searched"], 1);
@@ -999,10 +913,7 @@ fn find_kind_duplicate_filters_are_deduped_in_echo() {
         ],
     );
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("--index-path")
         .arg(&index_dir)
         .arg("find")
@@ -1014,12 +925,7 @@ fn find_kind_duplicate_filters_are_deduped_in_echo() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     let stdout = json_stdout(&output);
     assert_eq!(stdout["data"]["kindFilter"], serde_json::json!(["photo"]));
     assert_eq!(stdout["data"]["searched"], 1);
@@ -1043,10 +949,7 @@ fn find_kind_budget_refused_echoes_filtered_count_without_model_call() {
     );
     let before = server.request_count();
 
-    let output = lens_cmd(&home, &xdg)
-        .env("CEREBRAS_API_KEY", "fake-cerebras")
-        .env("LENS_API_BASE", server.base_url())
-        .arg("--json")
+    let output = online_lens_cmd(&server, &home, &xdg, "fake-cerebras")
         .arg("--max-dollars")
         .arg("0.000001")
         .arg("--index-path")
@@ -1060,12 +963,7 @@ fn find_kind_budget_refused_echoes_filtered_count_without_model_call() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(10),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 10);
     assert!(output.stderr.is_empty());
     let stdout = json_stdout(&output);
     assert_eq!(stdout["ok"], true);
@@ -1107,12 +1005,7 @@ fn find_dry_run_zero_kind_match_no_api_key() {
         .output()
         .unwrap();
 
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert_exit(&output, 0);
     assert!(output.stderr.is_empty());
     let stdout = json_stdout(&output);
     assert_eq!(

@@ -14,6 +14,7 @@ use crate::normalize::{NormalizeOutput, normalize_image};
 use crate::providers::Spend;
 use crate::providers::cerebras::{
     CerebrasClient, ChatOpts, ChatResponse, JsonSchema, Message, ResponseFormat, json_repair,
+    parse_repaired_json,
 };
 use crate::store::{IndexRecord, Store};
 use crate::walk::{WalkedFile, partition_with_stale_all, walk_library};
@@ -351,11 +352,11 @@ fn caption_one(file: WalkedFile, chat: &dyn CaptionChat) -> WorkerOutput {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[doc(hidden)]
 pub struct CaptionPayload {
-    description: String,
-    filename: String,
-    tags: Vec<String>,
-    text_content: String,
-    kind: String,
+    pub description: String,
+    pub filename: String,
+    pub tags: Vec<String>,
+    pub text_content: String,
+    pub kind: String,
 }
 
 #[derive(Debug)]
@@ -401,9 +402,6 @@ fn caption_normalized(
                 })
             }
         },
-        Err(err) if err.to_string().contains("invalid_image_data") => {
-            Err(CaptionFailure::InvalidImageData)
-        }
         Err(err) => Err(map_caption_error(err)),
     }
 }
@@ -468,8 +466,7 @@ fn map_caption_error(err: LensError) -> CaptionFailure {
 }
 
 fn parse_caption(content: &str) -> Result<CaptionPayload, CaptionFailure> {
-    let repaired = json_repair(content);
-    serde_json::from_str(&repaired).map_err(|_| CaptionFailure::Parse)
+    parse_repaired_json(content).map_err(|_| CaptionFailure::Parse)
 }
 
 fn record_from_caption(file: WalkedFile, caption: CaptionPayload) -> IndexRecord {

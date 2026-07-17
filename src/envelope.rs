@@ -150,12 +150,7 @@ pub fn emit_success(env: &SuccessEnvelope, force_json: bool) {
     if !force_json && stdout.is_terminal() {
         render_success_human(env);
     } else {
-        let mut lock = stdout.lock();
-        let _ = writeln!(
-            lock,
-            "{}",
-            serde_json::to_string(env).expect("envelope serializes")
-        );
+        emit_json_line(&mut stdout.lock(), env);
     }
 }
 
@@ -166,14 +161,17 @@ pub fn emit_error(env: &ErrorEnvelope, force_json: bool) -> i32 {
     if !force_json && stderr.is_terminal() {
         render_error_human(env);
     } else {
-        let mut lock = stderr.lock();
-        let _ = writeln!(
-            lock,
-            "{}",
-            serde_json::to_string(env).expect("envelope serializes")
-        );
+        emit_json_line(&mut stderr.lock(), env);
     }
     env.exit_code
+}
+
+fn emit_json_line(writer: &mut impl Write, value: &impl Serialize) {
+    let _ = writeln!(
+        writer,
+        "{}",
+        serde_json::to_string(value).expect("envelope serializes")
+    );
 }
 
 fn render_success_human(env: &SuccessEnvelope) {
@@ -242,8 +240,8 @@ mod tests {
     #[test]
     fn golden_success_envelope_has_exact_camel_case_fields() {
         let env = SuccessEnvelope::new(
-            "ask",
-            serde_json::json!({"question": "what is prospera", "outcome": "answered"}),
+            "find",
+            serde_json::json!({"query": "beach club", "outcome": "answered"}),
             CostDollars {
                 model: 0.09,
                 search: 0.04,
@@ -262,7 +260,7 @@ mod tests {
 
         assert_eq!(json["schema"], "lens.cli.response.v1");
         assert_eq!(json["ok"], true);
-        assert_eq!(json["command"], "ask");
+        assert_eq!(json["command"], "find");
         assert_eq!(json["requestId"], FIXED_REQUEST_ID);
         assert_eq!(json["data"]["outcome"], "answered");
         assert_eq!(json["costDollars"]["model"], 0.09);
@@ -283,15 +281,15 @@ mod tests {
         let err = LensError::rate_limit("Cerebras returned 429")
             .with_provider(Provider::Cerebras)
             .with_retryable(true)
-            .with_partial(serde_json::json!({"claims": []}))
+            .with_partial(serde_json::json!({"hits": []}))
             .with_suggested_fix("wait and retry; Cerebras rate windows are minute-scale");
 
-        let env = ErrorEnvelope::from_error("ask", &err, Some(FIXED_REQUEST_ID.to_string()));
+        let env = ErrorEnvelope::from_error("find", &err, Some(FIXED_REQUEST_ID.to_string()));
         let json = serde_json::to_value(&env).unwrap();
 
         assert_eq!(json["schema"], "lens.cli.error.v1");
         assert_eq!(json["ok"], false);
-        assert_eq!(json["command"], "ask");
+        assert_eq!(json["command"], "find");
         assert_eq!(json["requestId"], FIXED_REQUEST_ID);
         assert_eq!(json["error"]["code"], "rate_limited");
         assert_eq!(json["error"]["category"], "rate_limited");
@@ -301,7 +299,7 @@ mod tests {
             json["error"]["message"],
             "rate limited: Cerebras returned 429"
         );
-        assert_eq!(json["error"]["partial"], serde_json::json!({"claims": []}));
+        assert_eq!(json["error"]["partial"], serde_json::json!({"hits": []}));
         assert_eq!(
             json["error"]["suggestedFix"],
             "wait and retry; Cerebras rate windows are minute-scale"
@@ -317,7 +315,7 @@ mod tests {
     #[test]
     fn error_envelope_without_provider_or_partial_omits_neither_field() {
         let err = LensError::usage("unknown flag --frobnicate");
-        let env = ErrorEnvelope::from_error("ask", &err, Some(FIXED_REQUEST_ID.to_string()));
+        let env = ErrorEnvelope::from_error("find", &err, Some(FIXED_REQUEST_ID.to_string()));
         let json = serde_json::to_value(&env).unwrap();
 
         assert_eq!(json["error"]["provider"], serde_json::Value::Null);

@@ -44,6 +44,23 @@ struct CommandCapability {
     stderr_on_error: Option<&'static str>,
 }
 
+impl CommandCapability {
+    fn free_read_only(name: &'static str, usage: &'static str) -> Self {
+        Self {
+            name,
+            usage,
+            read_only: true,
+            read_only_note: None,
+            destructive: false,
+            spends_money: false,
+            spends_money_note: None,
+            writes_index: None,
+            stdout: None,
+            stderr_on_error: None,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct GlobalFlag {
     name: &'static str,
@@ -173,18 +190,7 @@ fn commands() -> Vec<CommandCapability> {
             stdout: None,
             stderr_on_error: None,
         },
-        CommandCapability {
-            name: "status",
-            usage: "lens status [--dir DIR]",
-            read_only: true,
-            read_only_note: None,
-            destructive: false,
-            spends_money: false,
-            spends_money_note: None,
-            writes_index: None,
-            stdout: None,
-            stderr_on_error: None,
-        },
+        CommandCapability::free_read_only("status", "lens status [--dir DIR]"),
         CommandCapability {
             name: "doctor",
             usage: "lens doctor [--online]",
@@ -197,30 +203,8 @@ fn commands() -> Vec<CommandCapability> {
             stdout: None,
             stderr_on_error: None,
         },
-        CommandCapability {
-            name: "capabilities",
-            usage: "lens capabilities",
-            read_only: true,
-            read_only_note: None,
-            destructive: false,
-            spends_money: false,
-            spends_money_note: None,
-            writes_index: None,
-            stdout: None,
-            stderr_on_error: None,
-        },
-        CommandCapability {
-            name: "schema",
-            usage: "lens schema [response|error|all]",
-            read_only: true,
-            read_only_note: None,
-            destructive: false,
-            spends_money: false,
-            spends_money_note: None,
-            writes_index: None,
-            stdout: None,
-            stderr_on_error: None,
-        },
+        CommandCapability::free_read_only("capabilities", "lens capabilities"),
+        CommandCapability::free_read_only("schema", "lens schema [response|error|all]"),
     ]
 }
 

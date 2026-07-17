@@ -206,21 +206,3 @@ fn best_match<'a>(needle: &str, choices: &'a [&'a str]) -> Option<&'a str> {
         .min_by_key(|(_, distance)| *distance)
         .map(|(choice, _)| choice)
 }
-
-#[cfg(test)]
-mod tests {
-    use std::ffi::OsString;
-
-    #[test]
-    fn emit_parse_error_detects_json_flag_in_raw_args() {
-        // The stderr writer is not injectable, so pin the raw-argument seam.
-        let args_with_json: Vec<OsString> =
-            vec!["lens".into(), "--json".into(), "--badflag".into()];
-        let force_json = args_with_json.iter().any(|arg| arg == "--json");
-        assert!(force_json);
-
-        let args_without_json: Vec<OsString> = vec!["lens".into(), "--badflag".into()];
-        let force_json = args_without_json.iter().any(|arg| arg == "--json");
-        assert!(!force_json);
-    }
-}

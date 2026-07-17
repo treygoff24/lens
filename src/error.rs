@@ -73,7 +73,7 @@ pub enum LensError {
     },
 
     /// Partial result from a hard pipeline failure. Budget-driven partials
-    /// (exit 10) must use the SUCCESS envelope path in `commands::ask` (exit
+    /// (exit 10) must use the success-envelope path in command handlers (exit
     /// 10 via the success envelope, not via this error variant). This variant
     /// exists for hard failures where an error envelope carries `error.partial`
     /// data alongside the failure context.
@@ -241,11 +241,11 @@ mod tests {
         let err = LensError::network("timed out")
             .with_provider(Provider::Cerebras)
             .with_retryable(true)
-            .with_partial(serde_json::json!({"claims": []}));
+            .with_partial(serde_json::json!({"hits": []}));
 
         assert_eq!(err.provider(), Some(Provider::Cerebras));
         assert!(err.is_retryable());
-        assert_eq!(err.partial_data(), Some(&serde_json::json!({"claims": []})));
+        assert_eq!(err.partial_data(), Some(&serde_json::json!({"hits": []})));
         assert_eq!(err.to_string(), "network error: timed out");
     }
 

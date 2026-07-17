@@ -54,7 +54,7 @@ impl Budget {
         if self.max_dollars.is_some_and(|cap| {
             spend.total_dollars() + outstanding + projected_unit_cost > cap + 1e-9
         }) {
-            let _ = self.hit.set("dollars");
+            self.hit.get_or_init(|| "dollars");
             return false;
         }
 
@@ -62,7 +62,7 @@ impl Budget {
             .max_seconds
             .is_some_and(|cap| self.start.elapsed() > Duration::from_secs(cap))
         {
-            let _ = self.hit.set("seconds");
+            self.hit.get_or_init(|| "seconds");
             return false;
         }
 

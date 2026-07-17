@@ -8,6 +8,10 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use lens::find::IdsPayload;
+use lens::indexer::CaptionPayload;
+use lens::providers::cerebras::TokenUsage;
+
 pub(super) struct MockServer {
     base_url: String,
     requests: Arc<AtomicUsize>,
@@ -31,17 +35,17 @@ struct MockState {
 }
 
 #[derive(Deserialize)]
-struct ChatRequest {
-    response_format: Option<ResponseFormat>,
+struct MockChatRequest {
+    response_format: Option<MockResponseFormat>,
 }
 
 #[derive(Deserialize)]
-struct ResponseFormat {
-    json_schema: JsonSchema,
+struct MockResponseFormat {
+    json_schema: MockJsonSchema,
 }
 
 #[derive(Deserialize)]
-struct JsonSchema {
+struct MockJsonSchema {
     name: String,
 }
 
@@ -55,7 +59,7 @@ enum MockResponse {
 #[derive(Serialize)]
 struct MockChatResponse {
     choices: [MockChoice; 1],
-    usage: MockUsage,
+    usage: TokenUsage,
 }
 
 #[derive(Serialize)]
@@ -66,26 +70,6 @@ struct MockChoice {
 #[derive(Serialize)]
 struct MockMessage {
     content: String,
-}
-
-#[derive(Serialize)]
-struct MockUsage {
-    prompt_tokens: u64,
-    completion_tokens: u64,
-}
-
-#[derive(Serialize)]
-struct IdsResponse<'a> {
-    ids: &'a [i64],
-}
-
-#[derive(Serialize)]
-struct CaptionResponse<'a> {
-    description: &'a str,
-    filename: &'static str,
-    tags: [&'static str; 2],
-    text_content: &'static str,
-    kind: &'static str,
 }
 
 impl MockServer {
@@ -245,7 +229,8 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<(String, String, Stri
 }
 
 fn chat_response(body: &str, state: &MockState) -> (u16, MockResponse) {
-    let request: ChatRequest = serde_json::from_str(body).expect("client request is valid JSON");
+    let request: MockChatRequest =
+        serde_json::from_str(body).expect("client request is valid JSON");
     let schema_name = request
         .response_format
         .as_ref()
@@ -286,18 +271,18 @@ fn chat_response(body: &str, state: &MockState) -> (u16, MockResponse) {
 }
 
 fn caption_json(description: &str) -> String {
-    serde_json::to_string(&CaptionResponse {
-        description,
-        filename: "mock-image",
-        tags: ["mock", "fixture"],
-        text_content: "fixture text",
-        kind: "photo",
+    serde_json::to_string(&CaptionPayload {
+        description: description.to_string(),
+        filename: "mock-image".to_string(),
+        tags: vec!["mock".to_string(), "fixture".to_string()],
+        text_content: "fixture text".to_string(),
+        kind: "photo".to_string(),
     })
     .unwrap()
 }
 
 fn ids_json(ids: &[i64]) -> String {
-    serde_json::to_string(&IdsResponse { ids }).unwrap()
+    serde_json::to_string(&IdsPayload { ids: ids.to_vec() }).unwrap()
 }
 
 fn chat_content(content: String) -> MockResponse {
@@ -305,7 +290,7 @@ fn chat_content(content: String) -> MockResponse {
         choices: [MockChoice {
             message: MockMessage { content },
         }],
-        usage: MockUsage {
+        usage: TokenUsage {
             prompt_tokens: 1000,
             completion_tokens: 1000,
         },

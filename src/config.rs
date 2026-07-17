@@ -1,6 +1,6 @@
 //! Config precedence: env > `~/.config/lens/config.toml` > built-in defaults.
 //! Missing API keys are not a load-time error — `doctor` reports them, and
-//! `ask` fails with an Auth error only when a key is actually needed.
+//! `index` and `find` fail with an Auth error only when a key is actually needed.
 
 use std::env;
 use std::fs;

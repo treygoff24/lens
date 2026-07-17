@@ -77,14 +77,16 @@ pub(crate) fn run_with_retries<T>(
     for attempt in 0..MAX_ATTEMPTS {
         match send() {
             Ok(value) => return Ok((value, retries)),
-            Err(HttpFailure::Status(status)) if retry_delay(status, attempt).is_some() => {
+            Err(HttpFailure::Status(status)) => {
+                let Some(delay) = retry_delay(status, attempt) else {
+                    return Err(status_error(provider, status));
+                };
                 if attempt + 1 == MAX_ATTEMPTS {
                     return Err(status_error(provider, status));
                 }
                 retries += 1;
-                sleep(retry_delay(status, attempt).expect("checked above"));
+                sleep(delay);
             }
-            Err(HttpFailure::Status(status)) => return Err(status_error(provider, status)),
             Err(HttpFailure::Transport(message)) => {
                 if attempt + 1 == MAX_ATTEMPTS {
                     return Err(LensError::network(message)

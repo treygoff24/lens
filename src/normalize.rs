@@ -1,5 +1,5 @@
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, File};
+use std::io::{BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -104,25 +104,25 @@ fn pass_through_ok(path: &Path) -> bool {
 }
 
 fn orientation_for_path(path: &Path) -> image::ImageResult<Orientation> {
-    let mut reader = ImageReader::open(path)?;
-    reader.limits(limits());
-    let mut decoder = reader.into_decoder()?;
+    let mut decoder = limited_reader(path)?.into_decoder()?;
     decoder.orientation()
 }
 
 fn image_dimensions(path: &Path) -> image::ImageResult<(u32, u32)> {
-    let mut reader = ImageReader::open(path)?;
-    reader.limits(limits());
-    reader.into_dimensions()
+    limited_reader(path)?.into_dimensions()
 }
 
 fn decode_with_orientation(path: &Path) -> image::ImageResult<(DynamicImage, Orientation)> {
-    let mut reader = ImageReader::open(path)?;
-    reader.limits(limits());
-    let mut decoder = reader.into_decoder()?;
+    let mut decoder = limited_reader(path)?.into_decoder()?;
     let orientation = decoder.orientation()?;
     let image = DynamicImage::from_decoder(decoder)?;
     Ok((image, orientation))
+}
+
+fn limited_reader(path: &Path) -> image::ImageResult<ImageReader<BufReader<File>>> {
+    let mut reader = ImageReader::open(path)?;
+    reader.limits(limits());
+    Ok(reader)
 }
 
 fn limits() -> Limits {
