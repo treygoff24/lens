@@ -60,12 +60,8 @@ fn read_file_config(path: &Path) -> Result<FileConfig, LensError> {
             path.display()
         ))
     })?;
-    toml::from_str(&text).map_err(|e| {
-        LensError::config(format!(
-            "failed to parse config file {}: {e}",
-            path.display()
-        ))
-    })
+    toml::from_str(&text)
+        .map_err(|_| LensError::config(format!("failed to parse config file {}", path.display())))
 }
 
 #[cfg(unix)]
@@ -355,6 +351,27 @@ mod tests {
         let err = Config::load_from(Some(&path)).unwrap_err();
         assert_eq!(err.exit_code(), 3);
         assert_eq!(err.code(), "config");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn malformed_config_error_does_not_echo_secrets() {
+        let _guard = env_lock().lock().unwrap();
+        clear_env();
+
+        let dir = temp_dir("secret-parse-error");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        write_config(
+            &path,
+            "cerebras_api_key = \"must-not-leak\"\ncerebras_api_key = \"duplicate\"",
+        );
+
+        let message = Config::load_from(Some(&path)).unwrap_err().to_string();
+        assert!(message.contains(&path.display().to_string()));
+        assert!(!message.contains("must-not-leak"));
+        assert!(!message.contains("duplicate"));
 
         fs::remove_dir_all(&dir).unwrap();
     }
