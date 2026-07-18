@@ -151,7 +151,7 @@ impl Drop for MockServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            handle.join().expect("mock server thread exits cleanly");
         }
     }
 }

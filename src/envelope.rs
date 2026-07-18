@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::error::LensError;
+use crate::error::{FindPartialData, LensError};
 
 fn new_request_id(request_id: Option<String>) -> String {
     request_id.unwrap_or_else(|| {
@@ -57,21 +57,21 @@ pub struct Diagnostics {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SuccessEnvelope {
+pub struct SuccessEnvelope<T> {
     pub schema: String,
     pub ok: bool,
     pub command: String,
     pub request_id: String,
-    pub data: serde_json::Value,
+    pub data: T,
     pub cost_dollars: CostDollars,
     pub budget: Budget,
     pub diagnostics: Diagnostics,
 }
 
-impl SuccessEnvelope {
+impl<T> SuccessEnvelope<T> {
     pub fn new(
         command: impl Into<String>,
-        data: serde_json::Value,
+        data: T,
         cost_dollars: CostDollars,
         budget: Budget,
         diagnostics: Diagnostics,
@@ -98,7 +98,7 @@ pub struct ErrorDetail {
     pub retryable: bool,
     pub provider: Option<String>,
     pub message: String,
-    pub partial: Option<serde_json::Value>,
+    pub partial: Option<FindPartialData>,
     pub suggested_fix: Option<String>,
 }
 
@@ -145,7 +145,7 @@ impl ErrorEnvelope {
 
 /// Prints the success envelope. Human-readable text when stdout is a TTY and
 /// JSON wasn't forced; compact JSON otherwise (piped, or `--json`/`force_json`).
-pub fn emit_success(env: &SuccessEnvelope, force_json: bool) {
+pub fn emit_success(env: &SuccessEnvelope<impl Serialize>, force_json: bool) {
     let stdout = io::stdout();
     if !force_json && stdout.is_terminal() {
         render_success_human(env);
@@ -174,7 +174,7 @@ fn emit_json_line(writer: &mut impl Write, value: &impl Serialize) {
     );
 }
 
-fn render_success_human(env: &SuccessEnvelope) {
+fn render_success_human(env: &SuccessEnvelope<impl Serialize>) {
     println!("lens {} — ok (requestId {})", env.command, env.request_id);
     println!(
         "cost: ${:.4} (model ${:.4} + search ${:.4}){}",
@@ -233,7 +233,18 @@ fn render_error_human_to(env: &ErrorEnvelope, writer: &mut impl Write) -> io::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Provider;
+    use crate::error::{FindPartialData, Provider};
+
+    #[derive(Serialize)]
+    struct TestFindData<'a> {
+        query: &'a str,
+        outcome: &'a str,
+    }
+
+    #[derive(Serialize)]
+    struct TestCapabilitiesData {
+        name: &'static str,
+    }
 
     const FIXED_REQUEST_ID: &str = "00000000-0000-0000-0000-000000000000";
 
@@ -241,7 +252,10 @@ mod tests {
     fn golden_success_envelope_has_exact_camel_case_fields() {
         let env = SuccessEnvelope::new(
             "find",
-            serde_json::json!({"query": "beach club", "outcome": "answered"}),
+            TestFindData {
+                query: "beach club",
+                outcome: "answered",
+            },
             CostDollars {
                 model: 0.09,
                 search: 0.04,
@@ -281,7 +295,7 @@ mod tests {
         let err = LensError::rate_limit("Cerebras returned 429")
             .with_provider(Provider::Cerebras)
             .with_retryable(true)
-            .with_partial(serde_json::json!({"hits": []}))
+            .with_partial(FindPartialData { hits: Vec::new() })
             .with_suggested_fix("wait and retry; Cerebras rate windows are minute-scale");
 
         let env = ErrorEnvelope::from_error("find", &err, Some(FIXED_REQUEST_ID.to_string()));
@@ -328,7 +342,7 @@ mod tests {
     fn request_id_defaults_to_a_uuid_shaped_value_when_none_given() {
         let env = SuccessEnvelope::new(
             "capabilities",
-            serde_json::json!({}),
+            TestCapabilitiesData { name: "lens" },
             CostDollars {
                 model: 0.0,
                 search: 0.0,

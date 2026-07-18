@@ -5,12 +5,13 @@ use serde::Serialize;
 
 use crate::cli::{DoctorArgs, GlobalArgs};
 use crate::commands::common::{
-    CommandSuccess, metered_envelope, model_from, new_shared_spend, require_key, response_value,
+    CommandSuccess, metered_envelope, model_from, new_shared_spend, require_key,
 };
 use crate::config::Config;
 use crate::error::LensError;
 use crate::normalize::sips_exists;
 use crate::providers::cerebras::{CerebrasClient, ChatOpts, Message};
+use crate::store::data_home;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,7 +52,10 @@ struct Remediation {
     reversible: bool,
 }
 
-pub fn run(global: &GlobalArgs, args: &DoctorArgs) -> Result<CommandSuccess, LensError> {
+pub fn run(
+    global: &GlobalArgs,
+    args: &DoctorArgs,
+) -> Result<CommandSuccess<impl Serialize>, LensError> {
     let started = Instant::now();
     let cfg = Config::load()?;
     let spend = new_shared_spend();
@@ -79,8 +83,7 @@ pub fn run(global: &GlobalArgs, args: &DoctorArgs) -> Result<CommandSuccess, Len
         0
     };
     let report = report(checks);
-    let data = response_value("doctor report", report)?;
-    let envelope = metered_envelope("doctor", data, &spend, None, &started);
+    let envelope = metered_envelope("doctor", report, &spend, None, &started);
     Ok(CommandSuccess {
         envelope,
         exit_code,
@@ -162,13 +165,7 @@ fn sips_check() -> DoctorCheck {
 }
 
 fn data_dir_check() -> DoctorCheck {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let dir = base.join("lens");
+    let dir = data_home().join("lens");
     match std::fs::create_dir_all(&dir).and_then(|_| {
         let probe = dir.join(".doctor-write-test");
         std::fs::write(&probe, b"ok")?;

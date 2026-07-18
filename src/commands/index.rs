@@ -7,10 +7,8 @@ use crate::budget::Budget as RunBudget;
 use crate::cli::{GlobalArgs, IndexArgs};
 use crate::commands::common::{
     CommandSuccess, IndexStateData, OutcomeData, estimated_envelope, load_index_state,
-    metered_envelope, model_from, new_shared_spend, open_store, require_key, resolve_library_path,
-    response_value,
+    load_library, metered_envelope, new_shared_spend, require_key,
 };
-use crate::config::Config;
 use crate::error::LensError;
 use crate::indexer::{IndexOptions, IndexOutcome, index_library};
 use crate::providers::cerebras::CerebrasClient;
@@ -26,12 +24,19 @@ struct IndexDryRunData {
     projected_worst_case_cost: f64,
 }
 
-pub fn run(global: &GlobalArgs, args: &IndexArgs) -> Result<CommandSuccess, LensError> {
+#[derive(Serialize)]
+#[serde(untagged)]
+enum IndexResponseData {
+    DryRun(IndexDryRunData),
+    Report(OutcomeData<crate::indexer::IndexReport>),
+}
+
+pub fn run(
+    global: &GlobalArgs,
+    args: &IndexArgs,
+) -> Result<CommandSuccess<impl Serialize>, LensError> {
     let started = Instant::now();
-    let library_path = resolve_library_path(&args.dir)?;
-    let cfg = Config::load()?;
-    let model = model_from(&global.model, &cfg);
-    let store = open_store(&library_path, global.index_path.as_ref())?;
+    let (library_path, cfg, model, store) = load_library(global, &args.dir)?;
 
     if global.dry_run {
         return dry_run(global, &library_path, &store, &model);
@@ -46,28 +51,21 @@ pub fn run(global: &GlobalArgs, args: &IndexArgs) -> Result<CommandSuccess, Lens
     options.concurrency = usize::from(global.concurrency);
 
     let outcome = index_library(&library_path, &store, &chat, &budget, &options)?;
-    let report = outcome.report();
+    let is_partial = matches!(outcome, IndexOutcome::Partial(_));
+    let (report, outcome_name) = match outcome {
+        IndexOutcome::Complete(report) => (report, "complete"),
+        IndexOutcome::Partial(report) => (report, "partial"),
+    };
     if !global.json {
         for warning in &report.warnings {
             eprintln!("warning: {warning}");
         }
     }
-    let outcome_name = match outcome {
-        IndexOutcome::Complete(_) => "complete",
-        IndexOutcome::Partial(_) => "partial",
-    };
-    let data = response_value(
-        "index report",
-        OutcomeData {
-            data: report,
-            outcome: Some(outcome_name),
-        },
-    )?;
-    let exit_code = if matches!(outcome, IndexOutcome::Partial(_)) {
-        10
-    } else {
-        0
-    };
+    let data = IndexResponseData::Report(OutcomeData {
+        data: report,
+        outcome: Some(outcome_name),
+    });
+    let exit_code = if is_partial { 10 } else { 0 };
     let envelope = metered_envelope("index", data, &spend, budget.hit(), &started);
     Ok(CommandSuccess {
         envelope,
@@ -81,20 +79,19 @@ fn dry_run(
     library_path: &std::path::Path,
     store: &crate::store::Store,
     model: &str,
-) -> Result<CommandSuccess, LensError> {
+) -> Result<CommandSuccess<IndexResponseData>, LensError> {
     let state = load_index_state(library_path, store, model, global.concurrency)?;
     let envelope = estimated_envelope(
         "index",
-        "index plan",
-        IndexDryRunData {
+        IndexResponseData::DryRun(IndexDryRunData {
             state: state.data,
             outcome: "planned",
             dry_run: true,
             planned_work: state.planned_work,
             projected_worst_case_cost: state.projected_cost_dollars,
-        },
+        }),
         state.projected_cost_dollars,
-    )?;
+    );
     Ok(CommandSuccess {
         envelope,
         exit_code: 0,

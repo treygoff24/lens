@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::LensError;
-use crate::store::IndexRecord;
+use crate::store::{IndexRecord, last_records_by_path};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalkedFile {
@@ -54,10 +54,7 @@ pub(crate) fn partition_with_stale_all(
 }
 
 pub fn partition_freshness(walked: &[WalkedFile], records: &[IndexRecord]) -> Freshness {
-    let mut last_by_path: HashMap<&str, &IndexRecord> = HashMap::new();
-    for record in records {
-        last_by_path.insert(record.rel_path.as_str(), record);
-    }
+    let last_by_path = last_records_by_path(records);
 
     let mut seen = HashSet::new();
     let mut fresh = Vec::new();

@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
+use crate::cli::GlobalArgs;
 use crate::config::Config;
 use crate::envelope::{Budget, CostDollars, Diagnostics, SuccessEnvelope};
 use crate::error::{LensError, Provider};
@@ -11,8 +12,8 @@ use crate::providers::{SharedSpend, new_spend};
 use crate::store::Store;
 use crate::walk::{partition_with_stale_all, walk_library};
 
-pub struct CommandSuccess {
-    pub envelope: SuccessEnvelope,
+pub struct CommandSuccess<T> {
+    pub envelope: SuccessEnvelope<T>,
     pub exit_code: i32,
     pub hint: Option<&'static str>,
 }
@@ -75,10 +76,10 @@ pub(crate) fn load_index_state(
     })
 }
 
-pub(crate) fn zero_envelope(command: &str, data: impl Serialize) -> SuccessEnvelope {
+pub(crate) fn zero_envelope<T>(command: &str, data: T) -> SuccessEnvelope<T> {
     SuccessEnvelope::new(
         command,
-        serde_json::to_value(data).expect("command data serializes"),
+        data,
         zero_cost(),
         Budget { hit: None },
         Diagnostics {
@@ -89,21 +90,13 @@ pub(crate) fn zero_envelope(command: &str, data: impl Serialize) -> SuccessEnvel
     )
 }
 
-pub(crate) fn response_value(
-    description: &str,
-    data: impl Serialize,
-) -> Result<serde_json::Value, LensError> {
-    serde_json::to_value(data)
-        .map_err(|err| LensError::upstream(format!("failed to serialize {description}: {err}")))
-}
-
-pub(crate) fn metered_envelope(
+pub(crate) fn metered_envelope<T>(
     command: &str,
-    data: serde_json::Value,
+    data: T,
     spend: &SharedSpend,
     budget_hit: Option<&str>,
     started: &Instant,
-) -> SuccessEnvelope {
+) -> SuccessEnvelope<T> {
     SuccessEnvelope::new(
         command,
         data,
@@ -119,15 +112,14 @@ pub(crate) fn metered_envelope(
     )
 }
 
-pub(crate) fn estimated_envelope(
+pub(crate) fn estimated_envelope<T>(
     command: &str,
-    description: &str,
-    data: impl Serialize,
+    data: T,
     projected_cost: f64,
-) -> Result<SuccessEnvelope, LensError> {
-    Ok(SuccessEnvelope::new(
+) -> SuccessEnvelope<T> {
+    SuccessEnvelope::new(
         command,
-        response_value(description, data)?,
+        data,
         CostDollars {
             model: projected_cost,
             search: 0.0,
@@ -140,19 +132,19 @@ pub(crate) fn estimated_envelope(
             retries: 0,
         },
         None,
-    ))
+    )
 }
 
-pub(crate) fn zero_cost_success(
+pub(crate) fn zero_cost_success<T>(
     command: &str,
-    data: impl Serialize,
+    data: T,
     started: &Instant,
     hint: &'static str,
-) -> Result<CommandSuccess, LensError> {
-    Ok(CommandSuccess {
+) -> CommandSuccess<T> {
+    CommandSuccess {
         envelope: SuccessEnvelope::new(
             command,
-            response_value(&format!("{command} data"), data)?,
+            data,
             zero_cost(),
             Budget { hit: None },
             Diagnostics {
@@ -163,7 +155,7 @@ pub(crate) fn zero_cost_success(
         ),
         exit_code: 0,
         hint: Some(hint),
-    })
+    }
 }
 
 fn zero_cost() -> CostDollars {
@@ -203,6 +195,17 @@ pub(crate) fn require_key(key: Option<&str>) -> Result<String, LensError> {
 
 pub(crate) fn model_from(global_model: &Option<String>, cfg: &Config) -> String {
     global_model.clone().unwrap_or_else(|| cfg.model.clone())
+}
+
+pub(crate) fn load_library(
+    global: &GlobalArgs,
+    path: &Path,
+) -> Result<(PathBuf, Config, String, Store), LensError> {
+    let library_path = resolve_library_path(path)?;
+    let cfg = Config::load()?;
+    let model = model_from(&global.model, &cfg);
+    let store = open_store(&library_path, global.index_path.as_ref())?;
+    Ok((library_path, cfg, model, store))
 }
 
 pub(crate) fn open_store(

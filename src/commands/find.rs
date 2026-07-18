@@ -8,11 +8,9 @@ use serde::Serialize;
 use crate::budget::Budget as RunBudget;
 use crate::cli::{FindArgs, GlobalArgs};
 use crate::commands::common::{
-    CommandSuccess, OutcomeData, estimated_envelope, metered_envelope, model_from,
-    new_shared_spend, open_store, require_key, resolve_library_path, response_value,
-    zero_cost_success,
+    CommandSuccess, OutcomeData, estimated_envelope, load_library, metered_envelope,
+    new_shared_spend, require_key, zero_cost_success,
 };
-use crate::config::Config;
 use crate::error::LensError;
 use crate::find::{FindContext, FindData, FindOptions, find_with_options, plan};
 use crate::providers::cerebras::CerebrasClient;
@@ -20,26 +18,33 @@ use crate::store::IndexRecord;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FindDryRunData<'a> {
-    query: &'a str,
+struct FindDryRunData {
+    query: String,
     dry_run: bool,
     #[serde(flatten)]
     plan: crate::find::FindPlan,
     warnings: Vec<String>,
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
-    kind_filter: &'a [String],
+    kind_filter: Vec<String>,
 }
 
-pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensError> {
+#[derive(Serialize)]
+#[serde(untagged)]
+enum FindResponseData {
+    DryRun(FindDryRunData),
+    Result(OutcomeData<FindData>),
+}
+
+pub fn run(
+    global: &GlobalArgs,
+    args: &FindArgs,
+) -> Result<CommandSuccess<impl Serialize>, LensError> {
     let started = Instant::now();
     if args.query.trim().is_empty() {
         return Err(LensError::no_input("find requires a non-empty <QUERY>")
             .with_suggested_fix("run `lens find \"beach club hero shot\" --dir ./photos`"));
     }
-    let library_path = resolve_library_path(&args.dir)?;
-    let cfg = Config::load()?;
-    let model = model_from(&global.model, &cfg);
-    let store = open_store(&library_path, global.index_path.as_ref())?;
+    let (library_path, cfg, model, store) = load_library(global, &args.dir)?;
     let mut loaded = store.load(&model)?;
     let unfiltered_count = loaded.records.len();
     let kind_filter = dedupe_kinds(args.kind.clone());
@@ -67,16 +72,15 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
         let projected_cost = plan.projected_cost_dollars;
         let envelope = estimated_envelope(
             "find",
-            "find data",
-            FindDryRunData {
-                query: &args.query,
+            FindResponseData::DryRun(FindDryRunData {
+                query: args.query.clone(),
                 dry_run: true,
                 plan,
                 warnings,
-                kind_filter: &kind_filter,
-            },
+                kind_filter: kind_filter.clone(),
+            }),
             projected_cost,
-        )?;
+        );
         return Ok(CommandSuccess {
             envelope,
             exit_code: 0,
@@ -92,15 +96,15 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
             vec!["index is empty; run lens index".into()],
             &[],
         );
-        return zero_cost_success(
+        return Ok(zero_cost_success(
             "find",
-            OutcomeData {
+            FindResponseData::Result(OutcomeData {
                 data,
                 outcome: None,
-            },
+            }),
             &started,
             "run `lens index --json` before searching this library",
-        );
+        ));
     }
 
     if let Some(warning) = zero_kind_warning {
@@ -113,15 +117,15 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
             warnings,
             &kind_filter,
         );
-        return zero_cost_success(
+        return Ok(zero_cost_success(
             "find",
-            OutcomeData {
+            FindResponseData::Result(OutcomeData {
                 data,
                 outcome: Some("answered"),
-            },
+            }),
             &started,
             "try a --kind value present in the index",
-        );
+        ));
     }
 
     let api_key = require_key(cfg.cerebras_api_key.as_deref())?;
@@ -158,13 +162,10 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
                 write_gallery(path, &data)?;
                 data.gallery_path = Some(path.to_string_lossy().to_string());
             }
-            response_value(
-                "find data",
-                OutcomeData {
-                    data,
-                    outcome: Some("answered"),
-                },
-            )?
+            FindResponseData::Result(OutcomeData {
+                data,
+                outcome: Some("answered"),
+            })
         }
         Err(err) if err.exit_code() == 10 && budget.hit().is_some() => {
             let data = empty_find_data(
@@ -174,13 +175,10 @@ pub fn run(global: &GlobalArgs, args: &FindArgs) -> Result<CommandSuccess, LensE
                 vec!["budget refused find call".into()],
                 &kind_filter,
             );
-            response_value(
-                "find data",
-                OutcomeData {
-                    data,
-                    outcome: Some("refused"),
-                },
-            )?
+            FindResponseData::Result(OutcomeData {
+                data,
+                outcome: Some("refused"),
+            })
         }
         Err(err) => return Err(err),
     };

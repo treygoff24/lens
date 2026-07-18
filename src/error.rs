@@ -2,9 +2,15 @@
 //! context (provider, retryability, partial pipeline output) to populate the
 //! `lens.cli.error.v1` envelope (see `envelope.rs`) without re-deriving it.
 
-use serde_json::Value;
+use serde::Serialize;
 
-/// Which upstream API an error originated from, if any.
+use crate::find::FindHit;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FindPartialData {
+    pub hits: Vec<FindHit>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Cerebras,
@@ -30,7 +36,7 @@ impl std::fmt::Display for Provider {
 pub struct ErrorContext {
     provider: Option<Provider>,
     retryable: bool,
-    partial: Option<Value>,
+    partial: Option<FindPartialData>,
     suggested_fix: Option<String>,
 }
 
@@ -150,7 +156,7 @@ impl LensError {
     }
 
     #[must_use]
-    pub fn with_partial(mut self, partial: Value) -> Self {
+    pub fn with_partial(mut self, partial: FindPartialData) -> Self {
         self.context_mut().partial = Some(partial);
         self
     }
@@ -169,7 +175,7 @@ impl LensError {
         self.context().retryable
     }
 
-    pub fn partial_data(&self) -> Option<&Value> {
+    pub fn partial_data(&self) -> Option<&FindPartialData> {
         self.context().partial.as_ref()
     }
 
@@ -241,11 +247,14 @@ mod tests {
         let err = LensError::network("timed out")
             .with_provider(Provider::Cerebras)
             .with_retryable(true)
-            .with_partial(serde_json::json!({"hits": []}));
+            .with_partial(FindPartialData { hits: Vec::new() });
 
         assert_eq!(err.provider(), Some(Provider::Cerebras));
         assert!(err.is_retryable());
-        assert_eq!(err.partial_data(), Some(&serde_json::json!({"hits": []})));
+        assert_eq!(
+            err.partial_data(),
+            Some(&FindPartialData { hits: Vec::new() })
+        );
         assert_eq!(err.to_string(), "network error: timed out");
     }
 

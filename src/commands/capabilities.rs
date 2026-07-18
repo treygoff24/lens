@@ -109,7 +109,7 @@ struct SchemaCommands {
     all: &'static str,
 }
 
-pub fn run(_global: &GlobalArgs) -> Result<CommandSuccess, LensError> {
+pub fn run(_global: &GlobalArgs) -> Result<CommandSuccess<impl Serialize>, LensError> {
     let data = CapabilitiesData {
         name: "lens",
         version: env!("CARGO_PKG_VERSION"),

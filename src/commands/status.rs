@@ -4,10 +4,8 @@ use serde::Serialize;
 
 use crate::cli::{GlobalArgs, StatusArgs};
 use crate::commands::common::{
-    CommandSuccess, IndexStateData, load_index_state, model_from, open_store, resolve_library_path,
-    zero_cost_success,
+    CommandSuccess, IndexStateData, load_index_state, load_library, zero_cost_success,
 };
-use crate::config::Config;
 use crate::error::LensError;
 
 #[derive(Serialize)]
@@ -19,14 +17,14 @@ struct StatusData {
     warnings: Vec<String>,
 }
 
-pub fn run(global: &GlobalArgs, args: &StatusArgs) -> Result<CommandSuccess, LensError> {
+pub fn run(
+    global: &GlobalArgs,
+    args: &StatusArgs,
+) -> Result<CommandSuccess<impl Serialize>, LensError> {
     let started = Instant::now();
-    let library_path = resolve_library_path(&args.dir)?;
-    let cfg = Config::load()?;
-    let model = model_from(&global.model, &cfg);
-    let store = open_store(&library_path, global.index_path.as_ref())?;
+    let (library_path, _, model, store) = load_library(global, &args.dir)?;
     let state = load_index_state(&library_path, &store, &model, global.concurrency)?;
-    zero_cost_success(
+    Ok(zero_cost_success(
         "status",
         StatusData {
             state: state.data,
@@ -35,5 +33,5 @@ pub fn run(global: &GlobalArgs, args: &StatusArgs) -> Result<CommandSuccess, Len
         },
         &started,
         "run `lens index --dry-run --json` to see planned captioning work",
-    )
+    ))
 }

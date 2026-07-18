@@ -53,13 +53,25 @@ pub fn run() -> i32 {
         Err(err) => return emit_parse_error(&raw_args, err),
     };
 
-    let command_name = command_name(&cli.command);
-    match dispatch(cli) {
+    let global = cli.global;
+    match cli.command {
+        Commands::Index(args) => finish(index::run(&global, &args), "index", force_json),
+        Commands::Find(args) => finish(find::run(&global, &args), "find", force_json),
+        Commands::Status(args) => finish(status::run(&global, &args), "status", force_json),
+        Commands::Doctor(args) => finish(doctor::run(&global, &args), "doctor", force_json),
+        Commands::Capabilities => finish(capabilities::run(&global), "capabilities", force_json),
+        Commands::Schema(args) => finish(schema::run(&global, &args), "schema", force_json),
+    }
+}
+
+fn finish<T: Serialize>(
+    result: Result<CommandSuccess<T>, LensError>,
+    command_name: &'static str,
+    force_json: bool,
+) -> i32 {
+    match result {
         Ok(success) => {
-            emit_success(
-                &success.envelope,
-                force_json || success.envelope.command != command_name,
-            );
+            emit_success(&success.envelope, force_json);
             if let Some(hint) = success.hint
                 && !force_json
                 && std::io::IsTerminal::is_terminal(&std::io::stdout())
@@ -72,29 +84,6 @@ pub fn run() -> i32 {
             let envelope = ErrorEnvelope::from_error(command_name, &err, None);
             emit_error(&envelope, force_json)
         }
-    }
-}
-
-fn dispatch(cli: Cli) -> Result<CommandSuccess, LensError> {
-    let global = cli.global;
-    match cli.command {
-        Commands::Index(args) => index::run(&global, &args),
-        Commands::Find(args) => find::run(&global, &args),
-        Commands::Status(args) => status::run(&global, &args),
-        Commands::Doctor(args) => doctor::run(&global, &args),
-        Commands::Capabilities => capabilities::run(&global),
-        Commands::Schema(args) => schema::run(&global, &args),
-    }
-}
-
-fn command_name(command: &Commands) -> &'static str {
-    match command {
-        Commands::Index(_) => "index",
-        Commands::Find(_) => "find",
-        Commands::Status(_) => "status",
-        Commands::Doctor(_) => "doctor",
-        Commands::Capabilities => "capabilities",
-        Commands::Schema(_) => "schema",
     }
 }
 

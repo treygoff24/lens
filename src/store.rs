@@ -322,11 +322,19 @@ impl Drop for StoreLock {
     }
 }
 
-fn data_home() -> PathBuf {
+pub(crate) fn data_home() -> PathBuf {
     env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+pub(crate) fn last_records_by_path(records: &[IndexRecord]) -> HashMap<&str, &IndexRecord> {
+    let mut last_by_path = HashMap::new();
+    for record in records {
+        last_by_path.insert(record.rel_path.as_str(), record);
+    }
+    last_by_path
 }
 
 fn hex_prefix(value: &str) -> String {

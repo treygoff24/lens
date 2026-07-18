@@ -39,7 +39,6 @@ pub struct IndexReport {
     pub stale: usize,
     pub new: usize,
     pub vanished: usize,
-    /// Structured warnings for the JSON envelope and human stderr renderer.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -263,11 +262,12 @@ fn run_caption_work(
                         let Some(reservation) =
                             budget.reserve(&spend_snapshot, CAPTION_WORST_CASE_COST)
                         else {
-                            let _ = tx.send(Some(WorkerOutput::Skipped(skip_report(
+                            tx.send(Some(WorkerOutput::Skipped(skip_report(
                                 file.rel_path,
                                 "budget_refused",
-                            ))));
-                            let _ = tx.send(None);
+                            ))))
+                            .expect("receiver lives until workers finish");
+                            tx.send(None).expect("receiver lives until workers finish");
                             return;
                         };
                         (file, reservation)
@@ -275,7 +275,8 @@ fn run_caption_work(
 
                     let output = caption_one(file, chat);
                     drop(reservation);
-                    let _ = tx.send(Some(output));
+                    tx.send(Some(output))
+                        .expect("receiver lives until workers finish");
                 }
             });
         }

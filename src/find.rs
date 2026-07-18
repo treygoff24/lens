@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -12,7 +12,7 @@ use crate::providers::cerebras::{
     parse_repaired_json,
 };
 use crate::providers::{SharedSpend, Spend};
-use crate::store::IndexRecord;
+use crate::store::{IndexRecord, last_records_by_path};
 
 const FIND_MAX_COMPLETION_TOKENS: u64 = 200;
 /// Estimated-token budget per model call. `estimate_tokens` is deliberately
@@ -239,7 +239,8 @@ fn chunked_ids(
                         invalid_ids_dropped: 0,
                     };
                     let result = call_for_ids(query, &chunk, chunk_top, ctx, &mut local_stats);
-                    let _ = tx.send((chunk_idx, result, local_stats));
+                    tx.send((chunk_idx, result, local_stats))
+                        .expect("receiver lives until workers finish");
                 }
             });
         }
@@ -403,11 +404,7 @@ struct SnapshotRecord {
 }
 
 fn make_snapshot(records: &[IndexRecord]) -> Vec<SnapshotRecord> {
-    let mut by_path: HashMap<&str, &IndexRecord> = HashMap::new();
-    for record in records {
-        by_path.insert(record.rel_path.as_str(), record);
-    }
-    let mut out = by_path
+    let mut out = last_records_by_path(records)
         .into_values()
         .cloned()
         .map(|record| SnapshotRecord { record })
