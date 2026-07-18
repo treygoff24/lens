@@ -35,6 +35,13 @@ pub struct ImageUrl {
 }
 
 impl Message {
+    pub fn system(text: impl Into<String>) -> Self {
+        Self {
+            role: "system".into(),
+            content: MessageContent::Text(text.into()),
+        }
+    }
+
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: "user".into(),

@@ -3,8 +3,12 @@
 //! `index` and `find` fail with an Auth error only when a key is actually needed.
 
 use std::env;
-use std::fs;
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use serde::Deserialize;
 
@@ -47,7 +51,10 @@ fn default_config_path() -> Option<PathBuf> {
 }
 
 fn read_file_config(path: &Path) -> Result<FileConfig, LensError> {
-    let text = fs::read_to_string(path).map_err(|e| {
+    let mut file = open_config_file(path)?;
+    validate_config_file(path, &file)?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(|e| {
         LensError::config(format!(
             "failed to read config file {}: {e}",
             path.display()
@@ -59,6 +66,99 @@ fn read_file_config(path: &Path) -> Result<FileConfig, LensError> {
             path.display()
         ))
     })
+}
+
+#[cfg(unix)]
+fn open_config_file(path: &Path) -> Result<File, LensError> {
+    use rustix::fs::{Mode, OFlags, open};
+    open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|err| {
+        LensError::config(format!(
+            "failed to open config file {} without following symlinks: {err}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn open_config_file(path: &Path) -> Result<File, LensError> {
+    File::open(path).map_err(|err| {
+        LensError::config(format!(
+            "failed to open config file {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn validate_config_file(path: &Path, file: &File) -> Result<(), LensError> {
+    let meta = file.metadata().map_err(|err| {
+        LensError::config(format!(
+            "failed to inspect config file {}: {err}",
+            path.display()
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(LensError::config(format!(
+            "config path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if meta.uid() != rustix::process::getuid().as_raw() || meta.mode() & 0o077 != 0 {
+        return Err(LensError::config(format!(
+            "config file must be owned by the current user and mode 600: {}",
+            path.display()
+        ))
+        .with_suggested_fix(format!("chmod 600 {}", path.display())));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_config_file(_path: &Path, _file: &File) -> Result<(), LensError> {
+    Ok(())
+}
+
+fn validate_api_base(value: &str) -> Result<String, LensError> {
+    let uri: ureq::http::Uri = value.parse().map_err(|err| {
+        LensError::config(format!("invalid Cerebras API base URL {value:?}: {err}"))
+    })?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| LensError::config("Cerebras API base URL must include an https scheme"))?;
+    let authority = uri
+        .authority()
+        .ok_or_else(|| LensError::config("Cerebras API base URL must include a host"))?;
+    if authority.as_str().contains('@') {
+        return Err(LensError::config(
+            "Cerebras API base URL must not contain embedded credentials",
+        ));
+    }
+    if uri
+        .path_and_query()
+        .and_then(|value| value.query())
+        .is_some()
+    {
+        return Err(LensError::config(
+            "Cerebras API base URL must not contain a query string",
+        ));
+    }
+    let host = uri.host().expect("an authority always has a host");
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback());
+    if scheme != "https" && !(scheme == "http" && loopback) {
+        return Err(LensError::config(
+            "Cerebras API base URL must use HTTPS; HTTP is allowed only for loopback development",
+        ));
+    }
+    Ok(value.trim_end_matches('/').to_string())
 }
 
 impl Config {
@@ -78,6 +178,11 @@ impl Config {
 
         let defaults = Config::default();
 
+        let api_base = env::var("LENS_API_BASE")
+            .ok()
+            .or(file_cfg.api_base)
+            .unwrap_or(defaults.api_base);
+
         Ok(Config {
             cerebras_api_key: env::var("CEREBRAS_API_KEY")
                 .ok()
@@ -86,10 +191,7 @@ impl Config {
                 .ok()
                 .or(file_cfg.model)
                 .unwrap_or(defaults.model),
-            api_base: env::var("LENS_API_BASE")
-                .ok()
-                .or(file_cfg.api_base)
-                .unwrap_or(defaults.api_base),
+            api_base: validate_api_base(&api_base)?,
             max_concurrency: env::var("LENS_MAX_CONCURRENCY")
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
@@ -102,6 +204,9 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Mutex, OnceLock};
 
     /// `Config::load` reads process-wide env vars; serialize the tests that
@@ -138,6 +243,12 @@ mod tests {
         // SAFETY: serialized by `env_lock`; no other thread reads/writes
         // these process-wide env vars concurrently.
         unsafe { env::set_var(key, value) };
+    }
+
+    fn write_config(path: &Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]
@@ -181,22 +292,21 @@ mod tests {
         let dir = temp_dir("file-config");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        fs::write(
+        write_config(
             &path,
             r#"
             cerebras_api_key = "file-cerebras-key"
             model = "file-model"
-            api_base = "http://file-base/v1"
+            api_base = "https://file-base/v1"
             max_concurrency = 3
             "#,
-        )
-        .unwrap();
+        );
 
         let cfg = Config::load_from(Some(&path)).unwrap();
 
         assert_eq!(cfg.cerebras_api_key.as_deref(), Some("file-cerebras-key"));
         assert_eq!(cfg.model, "file-model");
-        assert_eq!(cfg.api_base, "http://file-base/v1");
+        assert_eq!(cfg.api_base, "https://file-base/v1");
         assert_eq!(cfg.max_concurrency, 3);
 
         fs::remove_dir_all(&dir).unwrap();
@@ -210,7 +320,7 @@ mod tests {
         let dir = temp_dir("env-wins");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        fs::write(&path, r#"model = "file-model""#).unwrap();
+        write_config(&path, r#"model = "file-model""#);
 
         set_env("LENS_MODEL", "env-model");
 
@@ -240,11 +350,71 @@ mod tests {
         let dir = temp_dir("malformed");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        fs::write(&path, "not valid toml [[[").unwrap();
+        write_config(&path, "not valid toml [[[");
 
         let err = Config::load_from(Some(&path)).unwrap_err();
         assert_eq!(err.exit_code(), 3);
         assert_eq!(err.code(), "config");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn api_base_rejects_insecure_or_credentialed_urls() {
+        let _guard = env_lock().lock().unwrap();
+        clear_env();
+
+        for value in [
+            "http://example.com/v1",
+            "https://user:password@example.com/v1",
+            "https://example.com/v1?redirect=evil",
+            "not a url",
+        ] {
+            set_env("LENS_API_BASE", value);
+            assert!(Config::load_from(None).is_err(), "accepted {value}");
+        }
+
+        set_env("LENS_API_BASE", "http://127.0.0.1:8000/v1/");
+        assert_eq!(
+            Config::load_from(None).unwrap().api_base,
+            "http://127.0.0.1:8000/v1"
+        );
+        clear_env();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_readable_config_is_rejected_with_chmod_fix() {
+        let _guard = env_lock().lock().unwrap();
+        clear_env();
+        let dir = temp_dir("insecure-mode");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        fs::write(&path, r#"cerebras_api_key = "secret""#).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+
+        let err = Config::load_from(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("mode 600"));
+        assert!(err.suggested_fix().unwrap().starts_with("chmod 600"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_config_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = env_lock().lock().unwrap();
+        clear_env();
+        let dir = temp_dir("symlink");
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.toml");
+        let path = dir.join("config.toml");
+        write_config(&target, r#"cerebras_api_key = "secret""#);
+        symlink(&target, &path).unwrap();
+
+        assert!(Config::load_from(Some(&path)).is_err());
 
         fs::remove_dir_all(&dir).unwrap();
     }

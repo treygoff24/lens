@@ -5,6 +5,9 @@ use std::io::{BufRead, BufReader, Error, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -14,6 +17,20 @@ const SCHEMA_VERSION: u32 = 1;
 const PROMPT_VERSION: u32 = 1;
 const NORMALIZER_VERSION: u32 = 1;
 const STALE_LOCK_AFTER: Duration = Duration::from_secs(30 * 60);
+pub(crate) const DESCRIPTION_MAX: usize = 2_000;
+pub(crate) const FILENAME_MAX: usize = 200;
+pub(crate) const KIND_MAX: usize = 32;
+pub(crate) const TAG_MAX: usize = 64;
+pub(crate) const TAG_COUNT_MAX: usize = 16;
+pub(crate) const TEXT_CONTENT_MAX: usize = 120;
+
+pub(crate) fn sanitize_index_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -59,12 +76,16 @@ pub struct StoreLock {
 
 impl Store {
     pub fn open_at(dir: impl AsRef<Path>) -> Result<Self, LensError> {
-        fs::create_dir_all(dir.as_ref()).map_err(|err| {
+        create_private_dir(dir.as_ref()).map_err(|err| {
             LensError::config(format!(
                 "failed to create index directory {}: {err}",
                 dir.as_ref().display()
             ))
         })?;
+        verify_private_dir(dir.as_ref())?;
+        for name in ["index.jsonl", "meta.json", "index.lock"] {
+            harden_store_file(&dir.as_ref().join(name))?;
+        }
         Ok(Self {
             dir: dir.as_ref().to_path_buf(),
         })
@@ -199,7 +220,7 @@ impl Store {
             });
         }
 
-        let file = File::open(&path).map_err(|err| {
+        let file = open_read_nofollow(&path).map_err(|err| {
             LensError::config(format!("failed to read index {}: {err}", path.display()))
         })?;
         let lines = BufReader::new(file)
@@ -246,14 +267,11 @@ impl Store {
     }
 
     pub fn append(&self, record: &IndexRecord) -> Result<(), LensError> {
+        verify_private_dir(&self.dir)?;
         let path = self.index_path();
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|err| {
-                LensError::config(format!("failed to open index {}: {err}", path.display()))
-            })?;
+        let mut file = open_append_nofollow(&path).map_err(|err| {
+            LensError::config(format!("failed to open index {}: {err}", path.display()))
+        })?;
         let mut line = serde_json::to_vec(record)
             .map_err(|err| LensError::config(format!("failed to serialize index record: {err}")))?;
         line.push(b'\n');
@@ -277,27 +295,28 @@ impl Store {
         I: IntoIterator<Item = IndexRecord>,
     {
         let ordered = dedup_last_wins(records);
-        let tmp = self.dir.join("index.jsonl.tmp");
-        let mut file = File::create(&tmp).map_err(|err| {
-            LensError::config(format!("failed to create {}: {err}", tmp.display()))
-        })?;
+        verify_private_dir(&self.dir)?;
+        let mut file = private_temp_file(&self.dir)?;
         for record in &ordered {
-            serde_json::to_writer(&mut file, record).map_err(|err| {
+            serde_json::to_writer(file.as_file_mut(), record).map_err(|err| {
                 LensError::config(format!("failed to serialize index record: {err}"))
             })?;
-            file.write_all(b"\n").map_err(|err| {
-                LensError::config(format!("failed to write {}: {err}", tmp.display()))
+            file.as_file_mut().write_all(b"\n").map_err(|err| {
+                LensError::config(format!("failed to write temporary index: {err}"))
             })?;
         }
-        finish_atomic_write(&mut file, &tmp, &self.index_path())?;
+        finish_atomic_write(file, &self.index_path())?;
         Ok(ordered.len())
     }
 
     fn read_meta(&self) -> Result<StoreMeta, LensError> {
         let path = self.meta_path();
-        let text = fs::read_to_string(&path).map_err(|err| {
-            LensError::config(format!("failed to read metadata {}: {err}", path.display()))
-        })?;
+        let mut text = String::new();
+        open_read_nofollow(&path)
+            .and_then(|mut file| std::io::Read::read_to_string(&mut file, &mut text))
+            .map_err(|err| {
+                LensError::config(format!("failed to read metadata {}: {err}", path.display()))
+            })?;
         serde_json::from_str(&text).map_err(|err| {
             LensError::config(format!(
                 "failed to parse metadata {}: {err}",
@@ -337,6 +356,129 @@ pub(crate) fn last_records_by_path(records: &[IndexRecord]) -> HashMap<&str, &In
     last_by_path
 }
 
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true).mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)
+}
+
+#[cfg(unix)]
+fn verify_private_dir(path: &Path) -> Result<(), LensError> {
+    let meta = fs::symlink_metadata(path).map_err(|err| {
+        LensError::config(format!(
+            "failed to inspect index directory {}: {err}",
+            path.display()
+        ))
+    })?;
+    if !meta.is_dir() || meta.file_type().is_symlink() {
+        return Err(LensError::config(format!(
+            "index directory is not a real directory: {}",
+            path.display()
+        )));
+    }
+    if meta.uid() != rustix::process::getuid().as_raw() {
+        return Err(LensError::config(format!(
+            "index directory is not owned by the current user: {}",
+            path.display()
+        )));
+    }
+    if meta.mode() & 0o077 != 0 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|err| {
+            LensError::config(format!(
+                "failed to make index directory owner-only {}: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_private_dir(path: &Path) -> Result<(), LensError> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(LensError::config(format!(
+            "index path is not a directory: {}",
+            path.display()
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn harden_store_file(path: &Path) -> Result<(), LensError> {
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => {
+            return Err(LensError::config(format!(
+                "failed to inspect store file {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(LensError::config(format!(
+            "store path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if meta.uid() != rustix::process::getuid().as_raw() {
+        return Err(LensError::config(format!(
+            "store file is not owned by the current user: {}",
+            path.display()
+        )));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|err| {
+        LensError::config(format!(
+            "failed to make store file owner-only {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(unix))]
+fn harden_store_file(_path: &Path) -> Result<(), LensError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+    Ok(File::from(open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?))
+}
+
+#[cfg(not(unix))]
+fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn open_append_nofollow(path: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+    let file = File::from(open(
+        path,
+        OFlags::WRONLY | OFlags::CREATE | OFlags::APPEND | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::RUSR | Mode::WUSR,
+    )?);
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_append_nofollow(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
+}
+
 fn hex_prefix(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
@@ -345,24 +487,48 @@ fn hex_prefix(value: &str) -> String {
 }
 
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), LensError> {
-    let tmp = path.with_extension("json.tmp");
+    let dir = path.parent().ok_or_else(|| {
+        LensError::config(format!("store path has no parent: {}", path.display()))
+    })?;
+    verify_private_dir(dir)?;
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|err| LensError::config(format!("failed to serialize metadata: {err}")))?;
-    let mut file = File::create(&tmp)
-        .map_err(|err| LensError::config(format!("failed to create {}: {err}", tmp.display())))?;
-    file.write_all(&bytes)
-        .map_err(|err| LensError::config(format!("failed to write {}: {err}", tmp.display())))?;
-    finish_atomic_write(&mut file, &tmp, path)
+    let mut file = private_temp_file(dir)?;
+    file.as_file_mut()
+        .write_all(&bytes)
+        .map_err(|err| LensError::config(format!("failed to write temporary metadata: {err}")))?;
+    finish_atomic_write(file, path)
 }
 
-fn finish_atomic_write(file: &mut File, tmp: &Path, path: &Path) -> Result<(), LensError> {
-    file.flush()
-        .map_err(|err| LensError::config(format!("failed to flush {}: {err}", tmp.display())))?;
+fn private_temp_file(dir: &Path) -> Result<tempfile::NamedTempFile, LensError> {
+    tempfile::Builder::new()
+        .prefix(".lens-write-")
+        .tempfile_in(dir)
+        .map_err(|err| {
+            LensError::config(format!(
+                "failed to create private temporary file in {}: {err}",
+                dir.display()
+            ))
+        })
+}
+
+fn finish_atomic_write(mut file: tempfile::NamedTempFile, path: &Path) -> Result<(), LensError> {
+    file.as_file_mut()
+        .flush()
+        .map_err(|err| LensError::config(format!("failed to flush temporary store file: {err}")))?;
     // Sync before rename so a reported success is durable on disk.
-    file.sync_all()
-        .map_err(|err| LensError::config(format!("failed to sync {}: {err}", tmp.display())))?;
-    fs::rename(tmp, path)
-        .map_err(|err| LensError::config(format!("failed to replace {}: {err}", path.display())))
+    file.as_file()
+        .sync_all()
+        .map_err(|err| LensError::config(format!("failed to sync temporary store file: {err}")))?;
+    verify_private_dir(path.parent().expect("store path has a parent"))?;
+    file.persist(path).map_err(|err| {
+        LensError::config(format!(
+            "failed to replace {}: {}",
+            path.display(),
+            err.error
+        ))
+    })?;
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -373,7 +539,11 @@ struct LockMetadata {
 }
 
 fn create_lock_file(path: &Path) -> std::io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path)?;
     let body = LockMetadata {
         pid: std::process::id(),
         started_at: rfc3339_now(),
@@ -477,6 +647,8 @@ fn civil_from_days(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::{PermissionsExt, symlink};
     fn record(rel_path: &str, size: u64, description: &str) -> IndexRecord {
         IndexRecord {
             rel_path: rel_path.to_string(),
@@ -630,5 +802,67 @@ mod tests {
         assert_eq!(loaded.records[0].description, "second");
         assert_eq!(loaded.records[0].size, 3);
         assert_eq!(loaded.records[1].rel_path, "b.jpg");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_directories_and_files_are_owner_only() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("store");
+        let store = Store::open_at(&path).unwrap();
+        store.append(&record("a.jpg", 1, "one")).unwrap();
+        store.ensure_meta(parent.path(), "test-model").unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(store.index_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(store.meta_path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn predictable_temp_symlink_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_at(dir.path()).unwrap();
+        let victim = tempfile::NamedTempFile::new().unwrap();
+        fs::write(victim.path(), b"do not overwrite").unwrap();
+        symlink(victim.path(), dir.path().join("index.jsonl.tmp")).unwrap();
+
+        store
+            .rewrite_last_wins([record("a.jpg", 1, "one")])
+            .unwrap();
+
+        assert_eq!(fs::read(victim.path()).unwrap(), b"do not overwrite");
+        assert_eq!(store.load("m").unwrap().records.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_rejects_symlinked_data_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open_at(dir.path()).unwrap();
+        let victim = tempfile::NamedTempFile::new().unwrap();
+        fs::write(victim.path(), b"do not overwrite").unwrap();
+        symlink(victim.path(), dir.path().join("index.jsonl")).unwrap();
+
+        assert!(store.append(&record("a.jpg", 1, "one")).is_err());
+        assert_eq!(fs::read(victim.path()).unwrap(), b"do not overwrite");
+        assert!(Store::open_at(dir.path()).is_err());
     }
 }

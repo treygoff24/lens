@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::Instant;
 
@@ -16,11 +16,15 @@ use crate::providers::cerebras::{
     CerebrasClient, ChatOpts, ChatResponse, JsonSchema, Message, ResponseFormat, json_repair,
     parse_repaired_json,
 };
-use crate::store::{IndexRecord, Store};
+use crate::store::{
+    DESCRIPTION_MAX, FILENAME_MAX, IndexRecord, KIND_MAX, Store, TAG_COUNT_MAX, TAG_MAX,
+    TEXT_CONTENT_MAX, sanitize_index_text,
+};
 use crate::walk::{WalkedFile, partition_with_stale_all, walk_library};
 
 pub const CAPTION_WORST_CASE_COST: f64 = 0.008;
 pub const DEFAULT_INDEX_CONCURRENCY: usize = 25;
+const MAX_DECODE_CONCURRENCY: usize = 4;
 const PROMPT: &str = "Index this image for a searchable photo library. Transcribe any legible text verbatim into text_content (truncate past ~100 words).";
 const TERSE_PROMPT: &str = "Index this image for a searchable photo library. This image is text-dense: put only the first ~50 words of legible text in text_content and keep description to two sentences. The JSON must be complete.";
 
@@ -238,6 +242,7 @@ fn run_caption_work(
     store: &Store,
 ) -> Result<RunState, LensError> {
     let gate = Arc::new(Mutex::new(()));
+    let decode_gate = Arc::new(DecodeGate::new(MAX_DECODE_CONCURRENCY));
     let queue = Arc::new(Mutex::new(VecDeque::from(work)));
     let (tx, rx) = mpsc::channel();
     let workers = concurrency.max(1);
@@ -246,6 +251,7 @@ fn run_caption_work(
         for _ in 0..workers {
             let queue = Arc::clone(&queue);
             let gate = Arc::clone(&gate);
+            let decode_gate = Arc::clone(&decode_gate);
             let tx = tx.clone();
             scope.spawn(move || {
                 loop {
@@ -273,7 +279,7 @@ fn run_caption_work(
                         (file, reservation)
                     };
 
-                    let output = caption_one(file, chat);
+                    let output = caption_one(file, chat, &decode_gate);
                     drop(reservation);
                     tx.send(Some(output))
                         .expect("receiver lives until workers finish");
@@ -297,6 +303,41 @@ fn run_caption_work(
     Ok(state)
 }
 
+#[derive(Debug)]
+struct DecodeGate {
+    available: Mutex<usize>,
+    wake: Condvar,
+}
+
+impl DecodeGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            available: Mutex::new(limit.max(1)),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> DecodePermit<'_> {
+        let mut available = self.available.lock().unwrap();
+        while *available == 0 {
+            available = self.wake.wait(available).unwrap();
+        }
+        *available -= 1;
+        DecodePermit { gate: self }
+    }
+}
+
+struct DecodePermit<'a> {
+    gate: &'a DecodeGate,
+}
+
+impl Drop for DecodePermit<'_> {
+    fn drop(&mut self) {
+        *self.gate.available.lock().unwrap() += 1;
+        self.gate.wake.notify_one();
+    }
+}
+
 fn collect_worker_outputs(
     rx: mpsc::Receiver<Option<WorkerOutput>>,
     store: &Store,
@@ -317,14 +358,27 @@ fn collect_worker_outputs(
     Ok(state)
 }
 
-fn caption_one(file: WalkedFile, chat: &dyn CaptionChat) -> WorkerOutput {
+fn caption_one(file: WalkedFile, chat: &dyn CaptionChat, decode_gate: &DecodeGate) -> WorkerOutput {
     let ext = Path::new(&file.rel_path)
         .extension()
         .and_then(|ext| ext.to_str())
         .expect("walked image has a UTF-8 extension")
         .to_string();
 
-    let normalized = match normalize_image(&file.abs_path, &ext, false) {
+    let image = match file.open() {
+        Ok(image) => image,
+        Err(_) => {
+            return WorkerOutput::Skipped(skip_report(
+                file.rel_path,
+                crate::normalize::NormalizeSkipReason::CorruptImage,
+            ));
+        }
+    };
+    let normalized = {
+        let _permit = decode_gate.acquire();
+        normalize_image(&image, &ext, false)
+    };
+    let normalized = match normalized {
         NormalizeOutput::Normalized(normalized) => normalized,
         NormalizeOutput::Skip { reason, .. } => {
             return WorkerOutput::Skipped(skip_report(file.rel_path, reason));
@@ -334,7 +388,11 @@ fn caption_one(file: WalkedFile, chat: &dyn CaptionChat) -> WorkerOutput {
     match caption_normalized(&normalized.jpeg_bytes, chat) {
         Ok(caption) => WorkerOutput::Indexed(record_from_caption(file, caption)),
         Err(CaptionFailure::InvalidImageData) => {
-            match normalize_image(&file.abs_path, &ext, true) {
+            let reencoded = {
+                let _permit = decode_gate.acquire();
+                normalize_image(&image, &ext, true)
+            };
+            match reencoded {
                 NormalizeOutput::Normalized(reencoded) => {
                     match caption_normalized(&reencoded.jpeg_bytes, chat) {
                         Ok(caption) => WorkerOutput::Indexed(record_from_caption(file, caption)),
@@ -475,11 +533,16 @@ fn record_from_caption(file: WalkedFile, caption: CaptionPayload) -> IndexRecord
         rel_path: file.rel_path,
         size: file.size,
         mtime_ns: file.mtime_ns,
-        description: caption.description,
-        filename: caption.filename,
-        tags: caption.tags,
-        text_content: caption.text_content,
-        kind: caption.kind,
+        description: sanitize_index_text(&caption.description, DESCRIPTION_MAX),
+        filename: sanitize_index_text(&caption.filename, FILENAME_MAX),
+        tags: caption
+            .tags
+            .into_iter()
+            .take(TAG_COUNT_MAX)
+            .map(|tag| sanitize_index_text(&tag, TAG_MAX))
+            .collect(),
+        text_content: sanitize_index_text(&caption.text_content, TEXT_CONTENT_MAX),
+        kind: sanitize_index_text(&caption.kind, KIND_MAX),
     }
 }
 
@@ -591,6 +654,40 @@ mod tests {
             kind: "photo".into(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn caption_fields_are_sanitized_before_storage() {
+        let dir = fixture_library(1);
+        let file = crate::walk::walk_library(dir.path()).unwrap().remove(0);
+        let record = record_from_caption(
+            file,
+            CaptionPayload {
+                description: format!("description\n{}", "x".repeat(DESCRIPTION_MAX * 2)),
+                filename: "name\0".repeat(FILENAME_MAX),
+                tags: (0..TAG_COUNT_MAX * 2)
+                    .map(|_| "tag\r".repeat(TAG_MAX))
+                    .collect(),
+                text_content: "text\n".repeat(TEXT_CONTENT_MAX),
+                kind: "photo\u{1b}".repeat(KIND_MAX),
+            },
+        );
+
+        assert!(record.description.chars().count() <= DESCRIPTION_MAX);
+        assert!(record.filename.chars().count() <= FILENAME_MAX);
+        assert!(record.text_content.chars().count() <= TEXT_CONTENT_MAX);
+        assert!(record.kind.chars().count() <= KIND_MAX);
+        assert_eq!(record.tags.len(), TAG_COUNT_MAX);
+        assert!(record.tags.iter().all(|tag| tag.chars().count() <= TAG_MAX));
+        assert!(
+            record
+                .description
+                .chars()
+                .chain(record.filename.chars())
+                .chain(record.text_content.chars())
+                .chain(record.kind.chars())
+                .all(|ch| !ch.is_control())
+        );
     }
 
     fn fixture_library(count: usize) -> tempfile::TempDir {

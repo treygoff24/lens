@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::fs::{self, File};
+use std::path::{Component, Path, PathBuf};
 
 use crate::error::LensError;
 use crate::store::{IndexRecord, last_records_by_path};
@@ -16,6 +16,24 @@ pub struct WalkedFile {
     pub abs_path: PathBuf,
     pub size: u64,
     pub mtime_ns: i128,
+}
+
+impl WalkedFile {
+    /// Opens the walked file beneath the original library root without
+    /// following a symlink in any path component.
+    pub fn open(&self) -> Result<File, LensError> {
+        let relative = Path::new(&self.rel_path);
+        let mut root = self.abs_path.clone();
+        for _ in relative.components() {
+            root.pop();
+        }
+        open_beneath(&root, relative).map_err(|err| {
+            LensError::config(format!(
+                "refused to open {} beneath library root: {err}",
+                self.abs_path.display()
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,9 +52,14 @@ impl Freshness {
 }
 
 pub fn walk_library(root: impl AsRef<Path>) -> Result<Vec<WalkedFile>, LensError> {
-    let root = root.as_ref();
+    let root = fs::canonicalize(root.as_ref()).map_err(|err| {
+        LensError::config(format!(
+            "failed to resolve library path {}: {err}",
+            root.as_ref().display()
+        ))
+    })?;
     let mut out = Vec::new();
-    walk_dir(root, root, &mut out)?;
+    walk_dir(&root, &root, &mut out)?;
     out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(out)
 }
@@ -127,6 +150,47 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<WalkedFile>) -> Result<(), Le
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn open_beneath(root: &Path, relative: &Path) -> std::io::Result<File> {
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let mut components = relative.components().peekable();
+    let mut fd = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    while let Some(component) = components.next() {
+        let Component::Normal(name) = component else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "image path is not relative",
+            ));
+        };
+        let mut flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        if components.peek().is_some() {
+            flags |= OFlags::DIRECTORY;
+        }
+        fd = openat(&fd, name, flags, Mode::empty())?;
+    }
+    let file = File::from(fd);
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image path is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_beneath(_root: &Path, _relative: &Path) -> std::io::Result<File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "secure library opens are unsupported on this platform",
+    ))
 }
 
 fn rel_to_slashes(path: &Path) -> String {
@@ -236,5 +300,36 @@ mod tests {
         assert_eq!(partition.stale.len(), 1);
         assert_eq!(partition.new.len(), 1);
         assert_eq!(partition.vanished.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_file_replaced_by_symlink_after_walk() {
+        let library = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let image = library.path().join("image.jpg");
+        write(&image, b"inside");
+        let walked = walk_library(library.path()).unwrap();
+
+        fs::remove_file(&image).unwrap();
+        symlink(outside.path(), &image).unwrap();
+
+        assert!(walked[0].open().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_rejects_directory_replaced_by_symlink_after_walk() {
+        let library = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(&library.path().join("nested/image.jpg"), b"inside");
+        write(&outside.path().join("image.jpg"), b"outside");
+        let walked = walk_library(library.path()).unwrap();
+
+        fs::remove_file(library.path().join("nested/image.jpg")).unwrap();
+        fs::remove_dir(library.path().join("nested")).unwrap();
+        symlink(outside.path(), library.path().join("nested")).unwrap();
+
+        assert!(walked[0].open().is_err());
     }
 }

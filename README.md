@@ -60,7 +60,7 @@ lens capabilities
 lens schema [response|error|all]
 ```
 
-Global flags: `--json`, `--model`, `--max-dollars`, `--max-seconds`, `--index-path`, `--dry-run`, and `--concurrency N` (capped at 50; used by indexing and chunked find).
+Global flags: `--json`, `--model`, `--max-dollars`, `--max-seconds`, `--index-path`, `--dry-run`, and `--concurrency N` (capped at 50; used by indexing and chunked find). Image decoding is independently capped at four concurrent decodes.
 
 `find --kind photo` filters the index to records of the given kinds (repeatable or comma-separated: `--kind photo,screenshot`) before anything is sent to the model — improving precision when you want photographs rather than renders or screenshots, and cutting input tokens. Kinds come from the caption model's open vocabulary (`photo`, `graphic`, `screenshot`, `document`, …); the applied filter is echoed back as `kindFilter` in the envelope.
 
@@ -148,6 +148,10 @@ Per-file caption failures and skips (`unsupported_format`, `corrupt_image`, `too
 | `LENS_MODEL` | model default | `gemma-4-31b` |
 | `LENS_MAX_CONCURRENCY` | chunk/search worker default | `25` |
 | `XDG_DATA_HOME` | index storage root | `~/.local/share` |
+
+If you store `cerebras_api_key` in `~/.config/lens/config.toml`, keep the file
+private: `chmod 600 ~/.config/lens/config.toml`. On Unix, lens rejects config
+files owned by another user or readable/writable by group or other users.
 
 ## Index storage and locking
 

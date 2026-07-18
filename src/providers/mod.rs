@@ -19,6 +19,7 @@ pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) fn http_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(REQUEST_TIMEOUT))
+        .max_redirects(0)
         .build()
         .into()
 }
@@ -139,6 +140,11 @@ mod tests {
             join_url("http://localhost:8000/", "/chat/completions"),
             "http://localhost:8000/chat/completions"
         );
+    }
+
+    #[test]
+    fn authenticated_client_does_not_follow_redirects() {
+        assert_eq!(http_agent().config().max_redirects(), 0);
     }
 
     #[test]

@@ -5,6 +5,7 @@ use lens::indexer::{CaptionChat, CaptionPayload};
 use lens::normalize::{NormalizeOutput, normalize_image};
 use lens::providers::cerebras::{CerebrasClient, json_repair};
 use lens::providers::new_spend;
+use std::fs::File;
 use std::path::Path;
 
 fn main() {
@@ -16,7 +17,7 @@ fn main() {
         .and_then(|e| e.to_str())
         .expect("image path has a UTF-8 extension")
         .to_string();
-    let normalized = match normalize_image(Path::new(&path), &ext, false) {
+    let normalized = match normalize_image(&File::open(&path).expect("open image"), &ext, false) {
         NormalizeOutput::Normalized(n) => n,
         NormalizeOutput::Skip { reason, detail } => {
             eprintln!("SKIP {reason:?}: {detail:?}");

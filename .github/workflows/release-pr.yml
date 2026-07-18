@@ -1,0 +1,21 @@
+name: Release validation
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install pinned cargo-dist
+        shell: bash
+        run: .github/scripts/install-cargo-dist.sh
+      - name: Validate release plan
+        run: dist plan --allow-dirty --output-format=json > /dev/null

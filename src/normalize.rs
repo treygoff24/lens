@@ -1,12 +1,11 @@
-use std::fs::{self, File};
-use std::io::{BufReader, Cursor};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use image::codecs::jpeg::JpegEncoder;
 use image::metadata::Orientation;
-use image::{DynamicImage, GenericImageView, ImageDecoder, ImageReader, Limits};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageError, ImageReader, Limits};
+use tempfile::Builder;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Normalized {
@@ -34,12 +33,14 @@ pub enum NormalizeOutput {
 const MAX_LONG_SIDE: u32 = 1600;
 const JPEG_PASS_THROUGH_MAX_BYTES: u64 = 3_000_000;
 const MAX_RAW_JPEG_BYTES: usize = 6_500_000;
+const MAX_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 const DECODE_PIXEL_LIMIT: u32 = 12_000;
+const DECODE_ALLOCATION_LIMIT: u64 = 64 * 1024 * 1024;
 
-pub fn normalize_image(path: &Path, extension: &str, force_reencode: bool) -> NormalizeOutput {
+pub fn normalize_image(file: &File, extension: &str, force_reencode: bool) -> NormalizeOutput {
     let ext = extension.trim_start_matches('.').to_ascii_lowercase();
     if ext == "heic" {
-        return normalize_with_sips(path, true)
+        return normalize_with_sips(file, &ext, true)
             .unwrap_or_else(|| skip(NormalizeSkipReason::CorruptImage, "sips failed"));
     }
     if !supported_by_image_crate(&ext) {
@@ -50,12 +51,12 @@ pub fn normalize_image(path: &Path, extension: &str, force_reencode: bool) -> No
     }
 
     let is_jpeg = matches!(ext.as_str(), "jpg" | "jpeg");
-    if is_jpeg && !force_reencode && pass_through_ok(path) {
-        match orientation_for_path(path) {
+    if is_jpeg && !force_reencode && pass_through_ok(file) {
+        match orientation_for_file(file) {
             Ok(Orientation::NoTransforms) => {
-                return match fs::read(path) {
+                return match read_file(file, MAX_RAW_JPEG_BYTES as u64) {
                     Ok(bytes) if bytes.len() <= MAX_RAW_JPEG_BYTES => {
-                        match image_dimensions(path) {
+                        match image_dimensions(file) {
                             Ok(dimensions) => normalized_output(bytes, dimensions),
                             Err(err) => skip(
                                 NormalizeSkipReason::CorruptImage,
@@ -72,21 +73,17 @@ pub fn normalize_image(path: &Path, extension: &str, force_reencode: bool) -> No
         }
     }
 
-    match decode_with_orientation(path) {
+    match decode_with_orientation(file) {
         Ok((image, orientation)) => encode_resized(image, orientation),
-        Err(err) => normalize_with_sips(path, false).unwrap_or_else(|| {
-            // Decode limits reject size, not malformed image data.
-            if err.to_string().contains("Image size exceeds limit") {
-                skip(
-                    NormalizeSkipReason::TooLarge,
-                    format!("decode pixel limit exceeded: {err}"),
-                )
-            } else {
-                skip(
-                    NormalizeSkipReason::CorruptImage,
-                    format!("decode failed: {err}"),
-                )
-            }
+        Err(err @ ImageError::Limits(_)) => skip(
+            NormalizeSkipReason::TooLarge,
+            format!("decode limit exceeded: {err}"),
+        ),
+        Err(err) => normalize_with_sips(file, &ext, false).unwrap_or_else(|| {
+            skip(
+                NormalizeSkipReason::CorruptImage,
+                format!("decode failed: {err}"),
+            )
         }),
     }
 }
@@ -98,37 +95,67 @@ fn supported_by_image_crate(ext: &str) -> bool {
     )
 }
 
-fn pass_through_ok(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|meta| meta.len() <= JPEG_PASS_THROUGH_MAX_BYTES)
-        && image_dimensions(path).is_ok_and(|(width, height)| width.max(height) <= MAX_LONG_SIDE)
+fn pass_through_ok(file: &File) -> bool {
+    file.metadata()
+        .is_ok_and(|meta| meta.len() <= JPEG_PASS_THROUGH_MAX_BYTES)
+        && image_dimensions(file).is_ok_and(|(width, height)| width.max(height) <= MAX_LONG_SIDE)
 }
 
-fn orientation_for_path(path: &Path) -> image::ImageResult<Orientation> {
-    let mut decoder = limited_reader(path)?.into_decoder()?;
+fn orientation_for_file(file: &File) -> image::ImageResult<Orientation> {
+    let mut decoder = limited_reader(file)?.into_decoder()?;
     decoder.orientation()
 }
 
-fn image_dimensions(path: &Path) -> image::ImageResult<(u32, u32)> {
-    limited_reader(path)?.into_dimensions()
+fn image_dimensions(file: &File) -> image::ImageResult<(u32, u32)> {
+    limited_reader(file)?.into_dimensions()
 }
 
-fn decode_with_orientation(path: &Path) -> image::ImageResult<(DynamicImage, Orientation)> {
-    let mut decoder = limited_reader(path)?.into_decoder()?;
+fn decode_with_orientation(file: &File) -> image::ImageResult<(DynamicImage, Orientation)> {
+    let mut decoder = limited_reader(file)?.into_decoder()?;
     let orientation = decoder.orientation()?;
-    let image = DynamicImage::from_decoder(decoder)?;
+    let image = limited_reader(file)?.decode()?;
     Ok((image, orientation))
 }
 
-fn limited_reader(path: &Path) -> image::ImageResult<ImageReader<BufReader<File>>> {
-    let mut reader = ImageReader::open(path)?;
+fn limited_reader(file: &File) -> image::ImageResult<ImageReader<BufReader<File>>> {
+    let mut reader =
+        ImageReader::new(BufReader::new(rewound_clone(file)?)).with_guessed_format()?;
     reader.limits(limits());
     Ok(reader)
+}
+
+fn rewound_clone(file: &File) -> std::io::Result<File> {
+    let mut cloned = file.try_clone()?;
+    cloned.seek(SeekFrom::Start(0))?;
+    Ok(cloned)
+}
+
+fn read_file(file: &File, limit: u64) -> std::io::Result<Vec<u8>> {
+    let size = file.metadata()?.len();
+    if size > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "image exceeds input limit",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(size as usize);
+    rewound_clone(file)?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            "image exceeds input limit",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn limits() -> Limits {
     let mut limits = Limits::default();
     limits.max_image_width = Some(DECODE_PIXEL_LIMIT);
     limits.max_image_height = Some(DECODE_PIXEL_LIMIT);
+    limits.max_alloc = Some(DECODE_ALLOCATION_LIMIT);
     limits
 }
 
@@ -179,7 +206,11 @@ fn encode_jpeg(image: &DynamicImage, quality: u8) -> image::ImageResult<Vec<u8>>
     Ok(out)
 }
 
-fn normalize_with_sips(path: &Path, missing_as_unsupported: bool) -> Option<NormalizeOutput> {
+fn normalize_with_sips(
+    file: &File,
+    extension: &str,
+    missing_as_unsupported: bool,
+) -> Option<NormalizeOutput> {
     if !sips_exists() {
         return Some(skip(
             if missing_as_unsupported {
@@ -191,7 +222,34 @@ fn normalize_with_sips(path: &Path, missing_as_unsupported: bool) -> Option<Norm
         ));
     }
 
-    let out = temp_jpeg_path();
+    let mut input = Builder::new()
+        .prefix("lens-normalize-input-")
+        .suffix(&format!(".{extension}"))
+        .tempfile()
+        .ok()?;
+    if file.metadata().ok()?.len() > MAX_INPUT_BYTES {
+        return Some(skip(
+            NormalizeSkipReason::TooLarge,
+            "image exceeds sips input limit",
+        ));
+    }
+    let copied = std::io::copy(
+        &mut rewound_clone(file).ok()?.take(MAX_INPUT_BYTES + 1),
+        &mut input,
+    )
+    .ok()?;
+    if copied > MAX_INPUT_BYTES {
+        return Some(skip(
+            NormalizeSkipReason::TooLarge,
+            "image exceeds sips input limit",
+        ));
+    }
+    input.flush().ok()?;
+    let mut out = Builder::new()
+        .prefix("lens-normalize-output-")
+        .suffix(".jpg")
+        .tempfile()
+        .ok()?;
     let status = Command::new("sips")
         .args([
             "-s",
@@ -203,25 +261,18 @@ fn normalize_with_sips(path: &Path, missing_as_unsupported: bool) -> Option<Norm
             "-Z",
             "1600",
         ])
-        .arg(path)
+        .arg(input.path())
         .arg("--out")
-        .arg(&out)
+        .arg(out.path())
         .output()
         .ok()?;
     if !status.status.success() {
-        let _ = fs::remove_file(&out);
         return None;
     }
 
-    // Read before parsing so every later early return can remove the temp file.
-    let bytes = match fs::read(&out) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let _ = fs::remove_file(&out);
-            return None;
-        }
-    };
-    let _ = fs::remove_file(&out);
+    out.as_file_mut().seek(SeekFrom::Start(0)).ok()?;
+    let mut bytes = Vec::new();
+    out.as_file_mut().read_to_end(&mut bytes).ok()?;
     if bytes.len() > MAX_RAW_JPEG_BYTES {
         return Some(skip(
             NormalizeSkipReason::TooLarge,
@@ -250,14 +301,6 @@ pub(crate) fn sips_exists() -> bool {
         .is_ok()
 }
 
-fn temp_jpeg_path() -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is after the Unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("lens-normalize-{}-{nanos}.jpg", std::process::id()))
-}
-
 fn skip(reason: NormalizeSkipReason, detail: impl Into<String>) -> NormalizeOutput {
     NormalizeOutput::Skip {
         reason,
@@ -280,9 +323,15 @@ mod tests {
     use super::*;
     use image::codecs::gif::{GifEncoder, Repeat};
     use image::{ImageBuffer, Rgba};
+    use std::fs;
+    use std::path::Path;
 
     fn ext(path: &Path) -> String {
         path.extension().unwrap().to_string_lossy().into_owned()
+    }
+
+    fn normalize_path(path: &Path, extension: &str, force_reencode: bool) -> NormalizeOutput {
+        normalize_image(&File::open(path).unwrap(), extension, force_reencode)
     }
 
     #[test]
@@ -292,7 +341,7 @@ mod tests {
         let img = ImageBuffer::from_pixel(10, 8, Rgba([255u8, 0, 0, 255]));
         img.save(&path).unwrap();
 
-        let out = normalize_image(&path, &ext(&path), false);
+        let out = normalize_path(&path, &ext(&path), false);
         match out {
             NormalizeOutput::Normalized(normalized) => {
                 assert_eq!((normalized.width, normalized.height), (10, 8));
@@ -309,7 +358,7 @@ mod tests {
         let img = ImageBuffer::from_pixel(2000, 1000, Rgba([0u8, 255, 0, 255]));
         img.save(&path).unwrap();
 
-        let out = normalize_image(&path, &ext(&path), false);
+        let out = normalize_path(&path, &ext(&path), false);
         match out {
             NormalizeOutput::Normalized(normalized) => {
                 assert_eq!(normalized.width, 1600);
@@ -329,7 +378,7 @@ mod tests {
         let frame = image::Frame::new(ImageBuffer::from_pixel(4, 3, Rgba([1u8, 2, 3, 255])));
         encoder.encode_frame(frame).unwrap();
 
-        let out = normalize_image(&path, &ext(&path), false);
+        let out = normalize_path(&path, &ext(&path), false);
         assert!(matches!(out, NormalizeOutput::Normalized(_)));
     }
 
@@ -339,7 +388,7 @@ mod tests {
         let path = dir.path().join("bad.jpg");
         fs::write(&path, b"\x13\x99\x00not an image\xff\x00").unwrap();
 
-        let out = normalize_image(&path, &ext(&path), false);
+        let out = normalize_path(&path, &ext(&path), false);
         match out {
             NormalizeOutput::Skip { reason, .. } => {
                 assert!(matches!(
@@ -363,6 +412,59 @@ mod tests {
     fn f11_pixel_limit_exceeded_maps_to_too_large() {
         let reason = NormalizeSkipReason::TooLarge;
         assert_eq!(reason.to_string(), "too_large");
+    }
+
+    fn bmp_header(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(54);
+        bytes.extend_from_slice(b"BM");
+        bytes.extend_from_slice(&54_u32.to_le_bytes());
+        bytes.extend_from_slice(&[0; 4]);
+        bytes.extend_from_slice(&54_u32.to_le_bytes());
+        bytes.extend_from_slice(&40_u32.to_le_bytes());
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&24_u16.to_le_bytes());
+        bytes.extend_from_slice(&[0; 24]);
+        bytes
+    }
+
+    #[test]
+    fn decompression_bomb_dimensions_are_rejected_before_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomb.bmp");
+        fs::write(&path, bmp_header(DECODE_PIXEL_LIMIT + 1, 1)).unwrap();
+
+        let out = normalize_path(&path, "bmp", false);
+        assert!(
+            matches!(
+                &out,
+                NormalizeOutput::Skip {
+                    reason: NormalizeSkipReason::TooLarge,
+                    detail,
+                } if detail.contains("decode limit exceeded")
+            ),
+            "unexpected output: {out:?}"
+        );
+    }
+
+    #[test]
+    fn decompression_bomb_allocation_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bomb.bmp");
+        fs::write(&path, bmp_header(6_000, 6_000)).unwrap();
+
+        let out = normalize_path(&path, "bmp", false);
+        assert!(
+            matches!(
+                &out,
+                NormalizeOutput::Skip {
+                    reason: NormalizeSkipReason::TooLarge,
+                    detail,
+                } if detail.contains("decode limit exceeded")
+            ),
+            "unexpected output: {out:?}"
+        );
     }
 
     fn build_exif_app1_orientation_6() -> Vec<u8> {
@@ -413,7 +515,7 @@ mod tests {
         spliced.extend_from_slice(&jpeg_bytes[2..]);
         fs::write(&path, &spliced).unwrap();
 
-        let out = normalize_image(&path, "jpg", false);
+        let out = normalize_path(&path, "jpg", false);
         match out {
             NormalizeOutput::Normalized(normalized) => {
                 assert_eq!(
