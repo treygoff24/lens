@@ -38,6 +38,19 @@ const DECODE_PIXEL_LIMIT: u32 = 12_000;
 const DECODE_ALLOCATION_LIMIT: u64 = 64 * 1024 * 1024;
 
 pub fn normalize_image(file: &File, extension: &str, force_reencode: bool) -> NormalizeOutput {
+    let input_bytes = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(err) => {
+            return skip(
+                NormalizeSkipReason::CorruptImage,
+                format!("failed to inspect image: {err}"),
+            );
+        }
+    };
+    if input_bytes > MAX_INPUT_BYTES {
+        return skip(NormalizeSkipReason::TooLarge, "image exceeds input limit");
+    }
+
     let ext = extension.trim_start_matches('.').to_ascii_lowercase();
     if ext == "heic" {
         return normalize_with_sips(file, &ext, true)
@@ -349,6 +362,26 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn oversized_input_is_rejected_before_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("oversized.png");
+        File::create(&path)
+            .unwrap()
+            .set_len(MAX_INPUT_BYTES + 1)
+            .unwrap();
+
+        let out = normalize_path(&path, "png", false);
+
+        assert!(matches!(
+            out,
+            NormalizeOutput::Skip {
+                reason: NormalizeSkipReason::TooLarge,
+                ..
+            }
+        ));
     }
 
     #[test]

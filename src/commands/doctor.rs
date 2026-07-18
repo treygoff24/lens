@@ -1,3 +1,5 @@
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -166,11 +168,7 @@ fn sips_check() -> DoctorCheck {
 
 fn data_dir_check() -> DoctorCheck {
     let dir = data_home().join("lens");
-    match std::fs::create_dir_all(&dir).and_then(|_| {
-        let probe = dir.join(".doctor-write-test");
-        std::fs::write(&probe, b"ok")?;
-        std::fs::remove_file(probe)
-    }) {
+    match probe_data_dir(&dir) {
         Ok(()) => ok_check(
             "state.data_dir",
             "state",
@@ -191,6 +189,14 @@ fn data_dir_check() -> DoctorCheck {
             }),
         },
     }
+}
+
+fn probe_data_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut probe = tempfile::Builder::new()
+        .prefix(".doctor-write-test-")
+        .tempfile_in(dir)?;
+    probe.write_all(b"ok")
 }
 
 fn probe_cerebras(client: &CerebrasClient) -> DoctorCheck {
@@ -267,5 +273,23 @@ fn report(checks: Vec<DoctorCheck>) -> DoctorReport {
         summary,
         checks,
         run_id: None,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::probe_data_dir;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn data_dir_probe_does_not_follow_predictable_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(victim.path(), b"victim").unwrap();
+        symlink(victim.path(), dir.path().join(".doctor-write-test")).unwrap();
+
+        probe_data_dir(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(victim.path()).unwrap(), b"victim");
     }
 }

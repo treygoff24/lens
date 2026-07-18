@@ -18,12 +18,23 @@ pub const DEFAULT_MODEL: &str = "gemma-4-31b";
 pub const DEFAULT_API_BASE: &str = "https://api.cerebras.ai/v1";
 pub const DEFAULT_MAX_CONCURRENCY: u32 = 25;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Config {
     pub cerebras_api_key: Option<String>,
     pub model: String,
     pub api_base: String,
     pub max_concurrency: u32,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("cerebras_api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("api_base", &self.api_base)
+            .field("max_concurrency", &self.max_concurrency)
+            .finish()
+    }
 }
 
 impl Default for Config {
@@ -110,7 +121,7 @@ fn validate_config_file(path: &Path, file: &File) -> Result<(), LensError> {
             "config file must be owned by the current user and mode 600: {}",
             path.display()
         ))
-        .with_suggested_fix(format!("chmod 600 {}", path.display())));
+        .with_suggested_fix(r#"chmod 600 -- "$HOME/.config/lens/config.toml""#));
     }
     Ok(())
 }
@@ -178,6 +189,16 @@ impl Config {
             .ok()
             .or(file_cfg.api_base)
             .unwrap_or(defaults.api_base);
+        let max_concurrency = env::var("LENS_MAX_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .or(file_cfg.max_concurrency)
+            .unwrap_or(defaults.max_concurrency);
+        if !(1..=50).contains(&max_concurrency) {
+            return Err(LensError::config(
+                "max concurrency must be between 1 and 50",
+            ));
+        }
 
         Ok(Config {
             cerebras_api_key: env::var("CEREBRAS_API_KEY")
@@ -188,11 +209,7 @@ impl Config {
                 .or(file_cfg.model)
                 .unwrap_or(defaults.model),
             api_base: validate_api_base(&api_base)?,
-            max_concurrency: env::var("LENS_MAX_CONCURRENCY")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .or(file_cfg.max_concurrency)
-                .unwrap_or(defaults.max_concurrency),
+            max_concurrency,
         })
     }
 }
@@ -258,6 +275,19 @@ mod tests {
         assert_eq!(cfg.model, DEFAULT_MODEL);
         assert_eq!(cfg.api_base, DEFAULT_API_BASE);
         assert_eq!(cfg.max_concurrency, DEFAULT_MAX_CONCURRENCY);
+    }
+
+    #[test]
+    fn debug_redacts_cerebras_api_key() {
+        let cfg = Config {
+            cerebras_api_key: Some("must-not-leak".into()),
+            ..Config::default()
+        };
+
+        let debug = format!("{cfg:?}");
+
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("must-not-leak"));
     }
 
     #[test]
@@ -399,6 +429,27 @@ mod tests {
         clear_env();
     }
 
+    #[test]
+    fn configured_concurrency_must_be_between_one_and_fifty() {
+        let _guard = env_lock().lock().unwrap();
+        clear_env();
+
+        for value in ["0", "51", "4294967295"] {
+            set_env("LENS_MAX_CONCURRENCY", value);
+            assert!(Config::load_from(None).is_err(), "accepted {value}");
+        }
+        clear_env();
+
+        let dir = temp_dir("invalid-concurrency");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        write_config(&path, "max_concurrency = 51");
+
+        assert!(Config::load_from(Some(&path)).is_err());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn group_readable_config_is_rejected_with_chmod_fix() {
@@ -412,7 +463,10 @@ mod tests {
 
         let err = Config::load_from(Some(&path)).unwrap_err();
         assert!(err.to_string().contains("mode 600"));
-        assert!(err.suggested_fix().unwrap().starts_with("chmod 600"));
+        assert_eq!(
+            err.suggested_fix(),
+            Some(r#"chmod 600 -- "$HOME/.config/lens/config.toml""#)
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

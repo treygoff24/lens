@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashSet};
-use std::fs;
+use std::io::Write;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -241,7 +242,7 @@ fn zero_kind_warning(unfiltered_count: usize, kinds_present: &[String]) -> Strin
     )
 }
 
-fn write_gallery(path: &std::path::Path, data: &crate::find::FindData) -> Result<(), LensError> {
+fn write_gallery(path: &Path, data: &crate::find::FindData) -> Result<(), LensError> {
     let mut cards = String::new();
     for hit in &data.hits {
         cards.push_str(&format!(
@@ -256,8 +257,28 @@ fn write_gallery(path: &std::path::Path, data: &crate::find::FindData) -> Result
         escape_html(&data.query),
         escape_html(&data.query)
     );
-    fs::write(path, html).map_err(|err| {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut file = tempfile::Builder::new()
+        .prefix(".lens-gallery-")
+        .tempfile_in(parent)
+        .map_err(|err| {
+            LensError::config(format!(
+                "failed to create temporary gallery in {}: {err}",
+                parent.display()
+            ))
+        })?;
+    file.write_all(html.as_bytes()).map_err(|err| {
         LensError::config(format!("failed to write gallery {}: {err}", path.display()))
+    })?;
+    file.persist(path).map(|_| ()).map_err(|err| {
+        LensError::config(format!(
+            "failed to replace gallery {}: {}",
+            path.display(),
+            err.error
+        ))
     })
 }
 
@@ -278,7 +299,8 @@ fn escape_html(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_kinds, escape_html};
+    use super::{dedupe_kinds, escape_html, write_gallery};
+    use crate::find::FindData;
 
     #[test]
     fn html_escape_covers_model_text_boundaries() {
@@ -309,6 +331,38 @@ mod tests {
                 "graphic".to_string(),
                 "screenshot".to_string()
             ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gallery_replaces_symlink_without_touching_target_and_is_private() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let victim = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(victim.path(), b"victim").unwrap();
+        let gallery = dir.path().join("gallery.html");
+        symlink(victim.path(), &gallery).unwrap();
+        let data = FindData {
+            query: "test".into(),
+            hits: Vec::new(),
+            searched: 0,
+            mode: "single_shot".into(),
+            chunks: 1,
+            warnings: Vec::new(),
+            kind_filter: Vec::new(),
+            invalid_ids_dropped: 0,
+            gallery_path: None,
+        };
+
+        write_gallery(&gallery, &data).unwrap();
+
+        assert_eq!(std::fs::read(victim.path()).unwrap(), b"victim");
+        assert!(gallery.metadata().unwrap().is_file());
+        assert_eq!(
+            gallery.metadata().unwrap().permissions().mode() & 0o777,
+            0o600
         );
     }
 }
