@@ -70,3 +70,12 @@ lens --json status --dir ./photos             # free, offline: staleness + cost 
 - Rate-limit 429s are absorbed by internal retry/backoff; you don't need your own retry loop around `lens`.
 - Linux: HEIC files are skipped as `unsupported_format` (conversion needs macOS `sips`). Skips are reported inside the success envelope and never fail a run.
 - Windows is unsupported.
+
+## If you're working on lens itself, not just using it
+
+- The gate, all of it, before you claim done: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test && cargo build --release`.
+- Integration tests drive the real binary against a local mock Cerebras server — no key, no network, same as CI. To debug captioning against the live API: `CEREBRAS_API_KEY=... cargo run --release --example debug_caption -- path/to/image.jpg`.
+- The contract above is written down in four places that must move together: this file, the README exit-code table, `src/commands/capabilities.rs`, and `LensError::exit_code` in `src/error.rs` (pinned by the `exit_codes_match_contract` test).
+- Module map: `cli.rs` clap surface · `walk.rs` deterministic walk and `(relPath, size, mtime)` freshness key · `normalize.rs` in-memory ≤1600px JPEG · `indexer.rs` caption fan-out · `find.rs` single-shot vs chunked plus rerank · `store.rs` index directory, advisory lock, torn-trailing-line tolerance · `budget.rs` reservation gate · `providers/` Cerebras client and retry/backoff · `envelope.rs` and `error.rs` the contract itself.
+- `main` carries work past the v0.1.2 tag that is neither released nor pushed. Run `git log --oneline v0.1.2..main` before assuming an installed `lens` behaves like this tree.
+- Design doc, including the adversarial review's accepted and rejected findings: `docs/plans/2026-07-01-lens-cli-design.md`. Deliberate non-goals and the v2 seam: `docs/BACKLOG.md`.
