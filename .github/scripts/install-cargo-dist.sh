@@ -30,10 +30,11 @@ tmp_dir=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cargo-dist.XXXXXX")
 curl --proto '=https' --tlsv1.2 -LsSf \
   "https://github.com/axodotdev/cargo-dist/releases/download/v${version}/${archive}" \
   -o "$tmp_dir/$archive"
-if command -v sha256sum >/dev/null 2>&1; then
-  printf '%s  %s\n' "$sha256" "$tmp_dir/$archive" | sha256sum --check
-else
+# Prefer shasum: macOS runners ship a BSD sha256sum that has no --check.
+if command -v shasum >/dev/null 2>&1; then
   printf '%s  %s\n' "$sha256" "$tmp_dir/$archive" | shasum -a 256 --check
+else
+  printf '%s  %s\n' "$sha256" "$tmp_dir/$archive" | sha256sum --check
 fi
 tar -xJf "$tmp_dir/$archive" -C "$tmp_dir"
 mkdir -p "$HOME/.cargo/bin"

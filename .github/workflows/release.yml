@@ -132,7 +132,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           # Actually do builds and make zips and whatnot
-          dist build "--tag=$TAG" --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          dist build "--tag=$TAG" --allow-dirty --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
       - id: cargo-dist
         name: Post-build
@@ -186,7 +186,7 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          dist build "--tag=$TAG" --output-format=json "--artifacts=global" > dist-manifest.json
+          dist build "--tag=$TAG" --allow-dirty --output-format=json "--artifacts=global" > dist-manifest.json
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -239,7 +239,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          dist host "--tag=$TAG" --steps=upload --steps=release --output-format=json > dist-manifest.json
+          dist host "--tag=$TAG" --allow-dirty --steps=upload --steps=release --output-format=json > dist-manifest.json
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
