@@ -1,6 +1,6 @@
 # lens — post-launch backlog
 
-Shipped and public through v0.1.2 (2026-07-06). What follows are the deliberate
+Shipped and public through v0.1.3 (2026-10-22). What follows are the deliberate
 non-goals from the v1 design and the ship review — recorded so they are not
 re-litigated, not scheduled as work.
 

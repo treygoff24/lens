@@ -3,6 +3,26 @@
 All notable changes to `lens` are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.1.3] — 2026-10-22
+
+### Security
+
+- Updated the TLS trust-store and handshake crates that `lens` uses for every
+  HTTPS call to the captioning provider: `rustls-webpki` 0.103.13 → 0.103.16,
+  `webpki-roots` 1.0.8 → 1.0.10 and `rustls` 0.23.41 → 0.23.46. The refreshed
+  `webpki-roots` carries the current CA trust list (including the eMudhra CA
+  incident changes), and `rustls-webpki` 0.103.16 fixes certificate-validation
+  advisories RUSTSEC-2026-0346 through RUSTSEC-2026-0349 and
+  RUSTSEC-2026-0381 through RUSTSEC-2026-0383. Upgrade if you run `lens`
+  against the live API.
+
+### Changed
+
+- Also ships the hardening and cleanup work merged since 0.1.2: stricter
+  config, index-store, image-normalization and provider-client handling, a
+  reworked `capabilities` output, and a leaner image decoder feature set
+  (`jpeg`, `png`, `webp`, `gif`, `bmp`, `tiff`).
+
 ## [0.1.2] — 2026-07-06
 
 ### Fixed
