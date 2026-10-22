@@ -50,12 +50,11 @@ fn main() {
                 if parsed.is_err() {
                     eprintln!(
                         "RAW HEAD: {:?}",
-                        &resp.content.chars().take(150).collect::<String>()
+                        resp.content.chars().take(150).collect::<String>()
                     );
                     eprintln!(
                         "RAW TAIL: {:?}",
-                        &resp
-                            .content
+                        resp.content
                             .chars()
                             .rev()
                             .take(150)
